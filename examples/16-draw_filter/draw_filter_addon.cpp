@@ -434,6 +434,112 @@ namespace
 		probe = {};
 	}
 
+	bool begin_filter_suppression(command_list *cmd_list, filter_suppression &suppression)
+	{
+		if (cmd_list == nullptr || cmd_list->get_device()->get_api() != device_api::d3d11)
+			return false;
+
+		ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd_list->get_native()));
+		if (context == nullptr || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
+			return false;
+
+		ID3D11Device *device = nullptr;
+		context->GetDevice(&device);
+		if (device == nullptr)
+			return false;
+
+		suppression.context = context;
+		context->OMGetDepthStencilState(&suppression.old_depth_stencil, &suppression.old_stencil_reference);
+		context->OMGetBlendState(&suppression.old_blend, suppression.old_blend_factor, &suppression.old_sample_mask);
+
+		D3D11_DEPTH_STENCIL_DESC depth_desc = {};
+		depth_desc.DepthEnable = FALSE;
+		depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+		depth_desc.StencilEnable = FALSE;
+		depth_desc.StencilWriteMask = 0;
+		if (FAILED(device->CreateDepthStencilState(&depth_desc, &suppression.suppressed_depth_stencil)))
+		{
+			device->Release();
+			return false;
+		}
+
+		D3D11_BLEND_DESC blend_desc = {};
+		blend_desc.IndependentBlendEnable = TRUE;
+		for (D3D11_RENDER_TARGET_BLEND_DESC &render_target : blend_desc.RenderTarget)
+			render_target.RenderTargetWriteMask = 0;
+		if (FAILED(device->CreateBlendState(&blend_desc, &suppression.suppressed_blend)))
+		{
+			if (suppression.old_depth_stencil != nullptr) suppression.old_depth_stencil->Release();
+			if (suppression.old_blend != nullptr) suppression.old_blend->Release();
+			suppression = {};
+			device->Release();
+			return false;
+		}
+
+		context->OMSetDepthStencilState(suppression.suppressed_depth_stencil, suppression.old_stencil_reference);
+		context->OMSetBlendState(suppression.suppressed_blend, suppression.old_blend_factor, suppression.old_sample_mask);
+		device->Release();
+		return true;
+	}
+
+	void restore_filter_suppression(filter_suppression &suppression)
+	{
+		if (suppression.context != nullptr)
+		{
+			suppression.context->OMSetBlendState(suppression.old_blend, suppression.old_blend_factor, suppression.old_sample_mask);
+			suppression.context->OMSetDepthStencilState(suppression.old_depth_stencil, suppression.old_stencil_reference);
+		}
+		if (suppression.suppressed_blend != nullptr) suppression.suppressed_blend->Release();
+		if (suppression.old_blend != nullptr) suppression.old_blend->Release();
+		if (suppression.suppressed_depth_stencil != nullptr) suppression.suppressed_depth_stencil->Release();
+		if (suppression.old_depth_stencil != nullptr) suppression.old_depth_stencil->Release();
+		suppression = {};
+	}
+
+	void on_after_filtered_draw(command_list *cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
+	{
+		filter_suppression suppression;
+		{
+			std::lock_guard lock(s_filter_suppression_mutex);
+			const auto it = s_active_filter_suppressions.find(cmd_list);
+			if (it == s_active_filter_suppressions.end())
+				return;
+			suppression = std::move(it->second);
+			s_active_filter_suppressions.erase(it);
+		}
+		restore_filter_suppression(suppression);
+	}
+
+	void cleanup_active_filter_suppressions()
+	{
+		std::vector<filter_suppression> suppressions;
+		{
+			std::lock_guard lock(s_filter_suppression_mutex);
+			suppressions.reserve(s_active_filter_suppressions.size());
+			for (auto &entry : s_active_filter_suppressions)
+				suppressions.emplace_back(std::move(entry.second));
+			s_active_filter_suppressions.clear();
+		}
+		for (filter_suppression &suppression : suppressions)
+			restore_filter_suppression(suppression);
+	}
+
+	bool arm_filter_suppression(command_list *cmd_list)
+	{
+		filter_suppression suppression;
+		if (!begin_filter_suppression(cmd_list, suppression))
+			return false;
+
+		std::lock_guard lock(s_filter_suppression_mutex);
+		if (s_active_filter_suppressions.find(cmd_list) != s_active_filter_suppressions.end())
+		{
+			restore_filter_suppression(suppression);
+			return false;
+		}
+		s_active_filter_suppressions.emplace(cmd_list, std::move(suppression));
+		return true;
+	}
+
 	const char *topology_text(D3D11_PRIMITIVE_TOPOLOGY topology)
 	{
 		switch (topology)
@@ -579,6 +685,7 @@ namespace
 				return false;
 			}
 		}
+		const bool blocked_draw_suppressed = blocked && arm_filter_suppression(cmd_list);
 
 		D3D11_QUERY_DESC query_desc = { D3D11_QUERY_OCCLUSION, 0 };
 		if (FAILED(device->CreateQuery(&query_desc, &probe.candidate.query)))
@@ -879,7 +986,7 @@ namespace
 			if (blocked)
 			{
 				s_skipped_draws.fetch_add(1, std::memory_order_relaxed);
-				return true;
+				return !blocked_draw_suppressed;
 			}
 			return false;
 		}
@@ -936,7 +1043,7 @@ namespace
 		if (blocked)
 		{
 			s_skipped_draws.fetch_add(1, std::memory_order_relaxed);
-			return true;
+			return !blocked_draw_suppressed;
 		}
 		if (!scan_this_draw)
 			event_name.clear();
@@ -950,6 +1057,7 @@ namespace
 		// after_draw_indexed callback. Never let the one-pixel center probe leave
 		// its temporary D3D11 state active into the next frame.
 		cleanup_active_probes();
+		cleanup_active_filter_suppressions();
 
 		{
 			std::lock_guard lock(s_pick_mutex);
@@ -980,6 +1088,7 @@ namespace
 	void on_destroy_device(device *)
 	{
 		cleanup_active_probes();
+		cleanup_active_filter_suppressions();
 
 		std::lock_guard pick_lock(s_pick_mutex);
 		for (pick_candidate &candidate : s_pending_pick)
@@ -1171,6 +1280,7 @@ void register_addon_draw_filter()
 {
 	reshade::register_overlay(nullptr, draw_settings_overlay);
 	reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
+	reshade::register_event<reshade::addon_event::after_draw_indexed>(on_after_filtered_draw);
 	reshade::register_event<reshade::addon_event::begin_debug_event>(on_begin_debug_event);
 	reshade::register_event<reshade::addon_event::end_debug_event>(on_end_debug_event);
 	reshade::register_event<reshade::addon_event::insert_debug_marker>(on_insert_debug_marker);
@@ -1182,6 +1292,7 @@ void unregister_addon_draw_filter()
 {
 	disable_center_picker_after_draw_event();
 	reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
+	reshade::unregister_event<reshade::addon_event::after_draw_indexed>(on_after_filtered_draw);
 	reshade::unregister_event<reshade::addon_event::begin_debug_event>(on_begin_debug_event);
 	reshade::unregister_event<reshade::addon_event::end_debug_event>(on_end_debug_event);
 	reshade::unregister_event<reshade::addon_event::insert_debug_marker>(on_insert_debug_marker);
