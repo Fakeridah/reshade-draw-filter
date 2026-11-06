@@ -237,6 +237,10 @@ void STDMETHODCALLTYPE D3D12GraphicsCommandList::DrawIndexedInstanced(UINT Index
 		return;
 #endif
 	_orig->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::after_draw_indexed>())
+		reshade::invoke_addon_event<reshade::addon_event::after_draw_indexed>(this, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+#endif
 }
 void STDMETHODCALLTYPE D3D12GraphicsCommandList::Dispatch(UINT ThreadGroupCountX, UINT ThreadGroupCountY, UINT ThreadGroupCountZ)
 {

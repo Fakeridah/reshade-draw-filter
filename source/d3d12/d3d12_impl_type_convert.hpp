@@ -38,6 +38,7 @@ namespace reshade::d3d12
 		UINT count;
 		ID3D12Resource *readback_resource;
 		std::pair<ID3D12Fence *, UINT64> *fences;
+		bool cpu_resolve;
 	};
 
 	inline constexpr GUID extra_data_guid = { 0xB2257A30, 0x4014, 0x46EA, { 0xBD, 0x88, 0xDE, 0xC2, 0x1D, 0xB6, 0xA0, 0x2B } }; // {B2257A30-4014-46EA-BD88-DEC21DB6A02B}

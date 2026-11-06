@@ -77,8 +77,14 @@ namespace
 	thread_local bool s_in_partial_depth_rewrite = false;
 	std::atomic_bool s_enabled = true;
 	std::atomic_uint64_t s_skipped_draws = 0;
-	int s_input_index_count = 0;
-	std::atomic_int s_pick_limit = 32;
+	uint32_t s_input_index_count = 0;
+	std::atomic_uint s_pick_limit = 32;
+	// Keep enough query slots for a very busy frame. D3D11 has no practical
+	// result-count limit; this only bounds the single D3D12 query heap.
+	constexpr uint32_t s_d3d12_query_capacity = 65536;
+	std::mutex s_d3d12_query_mutex;
+	device *s_d3d12_query_device = nullptr;
+	query_heap s_d3d12_query_heap = {};
 	std::atomic_bool s_pick_requested = false;
 	std::atomic_uint s_pick_target_width = 0;
 	std::atomic_uint s_pick_target_height = 0;
@@ -90,7 +96,13 @@ namespace
 	struct draw_state
 	{
 		resource render_target = {};
+		std::vector<resource_view> render_targets;
+		resource_view depth_stencil = {};
+		bool in_render_pass = false;
 		pipeline current_pipeline = {};
+		primitive_topology topology = primitive_topology::undefined;
+		std::vector<viewport> viewports;
+		std::vector<rect> scissors;
 		resource index_buffer = {};
 		uint64_t index_buffer_offset = 0;
 		uint32_t index_size = 0;
@@ -109,6 +121,8 @@ namespace
 		std::string event_name;
 		uint64_t samples_passed = 0;
 		ID3D11Query *query = nullptr;
+		query_heap api_query_heap = {};
+		uint32_t api_query_index = UINT32_MAX;
 	};
 
 	struct marker_state
@@ -120,6 +134,17 @@ namespace
 	struct probe_state
 	{
 		pick_candidate candidate = {};
+		command_list *api_cmd_list = nullptr;
+		device *api_device = nullptr;
+		query_heap api_query_heap = {};
+		uint32_t api_query_index = UINT32_MAX;
+		std::vector<resource_view> old_render_targets;
+		resource_view api_old_depth_stencil = {};
+		std::vector<rect> api_old_scissors;
+		bool api_in_render_pass = false;
+		int32_t api_center_x = 0;
+		int32_t api_center_y = 0;
+		bool is_d3d12 = false;
 		ID3D11DeviceContext *context = nullptr;
 		ID3D11Device *device = nullptr;
 		ID3D11RasterizerState *old_rasterizer = nullptr;
@@ -174,6 +199,26 @@ namespace
 
 	void add_draw_match(const draw_match &match);
 	bool capture_draw_match(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance, draw_match &match);
+
+	bool center_picker_needs_state()
+	{
+		std::lock_guard lock(s_pick_mutex);
+		return s_pick_armed || s_pick_active;
+	}
+
+	bool is_observer_compatibility_path()
+	{
+		static const bool result = [] {
+			char module_path[MAX_PATH] = {};
+			const DWORD length = GetModuleFileNameA(nullptr, module_path, ARRAYSIZE(module_path));
+			if (length == 0 || length >= ARRAYSIZE(module_path))
+				return false;
+			const char *module_name = std::strrchr(module_path, '\\');
+			module_name = module_name != nullptr ? module_name + 1 : module_path;
+			return _stricmp(module_name, "ObserverSystemRedux.exe") == 0;
+		}();
+		return result;
+	}
 
 	bool ensure_isolated_discard_pixel_shader(ID3D11DeviceContext *context)
 	{
@@ -279,16 +324,30 @@ namespace
 		case pick_status::waiting: return "Waiting for GPU result";
 		case pick_status::ready: return "Results ready";
 		case pick_status::no_result: return "No indexed draw covered the center";
-		case pick_status::unsupported: return "Center picking requires D3D11";
-		case pick_status::disabled: return "Disabled for D3D11 stability";
+		case pick_status::unsupported: return "Center picking requires D3D11 or D3D12";
+		case pick_status::disabled: return "Center picking disabled for stability";
 		default: return "Idle";
 		}
 	}
 
 	void add_index_count(uint32_t index_count)
 	{
-		if (index_count != 288)
+		if (index_count == 0)
 			return;
+
+		std::vector<draw_match> recent_matches;
+		{
+			std::lock_guard lock(s_pick_mutex);
+			for (const pick_candidate &candidate : s_pick_results)
+				if (candidate.index_count == index_count && candidate.match.valid)
+					recent_matches.push_back(candidate.match);
+		}
+		if (!recent_matches.empty())
+		{
+			for (const draw_match &match : recent_matches)
+				add_draw_match(match);
+			return;
+		}
 
 		std::unique_lock lock(s_mutex);
 		if (std::find(s_blocked_index_counts.cbegin(), s_blocked_index_counts.cend(), index_count) == s_blocked_index_counts.cend())
@@ -309,15 +368,114 @@ namespace
 			s_swapchain_back_buffers.erase(swapchain->get_back_buffer(i));
 	}
 
-	void on_bind_render_targets_and_depth_stencil(command_list *cmd_list, uint32_t count, const resource_view *rtvs, resource_view)
+	void on_bind_render_targets_and_depth_stencil(command_list *cmd_list, uint32_t count, const resource_view *rtvs, resource_view dsv)
 	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return;
+
 		std::lock_guard lock(s_state_mutex);
 		draw_state &state = s_command_states[cmd_list];
-		state.render_target = count != 0 && rtvs != nullptr ? cmd_list->get_device()->get_resource_from_view(rtvs[0]) : resource {};
+		state.render_targets.clear();
+		if (count != 0 && rtvs != nullptr)
+			state.render_targets.assign(rtvs, rtvs + count);
+		// D3D11 permits null entries in an RTV array. Do not pass a null view
+		// handle to get_resource_from_view(), which dereferences it in the native
+		// implementation (Observer emits such binds while the picker is armed).
+		state.render_target = count != 0 && rtvs != nullptr && rtvs[0] != 0 ? cmd_list->get_device()->get_resource_from_view(rtvs[0]) : resource {};
+		state.depth_stencil = dsv;
+	}
+
+	bool on_begin_render_pass(command_list *cmd_list, uint32_t count, const render_pass_render_target_desc *rts, const render_pass_depth_stencil_desc *ds, render_pass_flags)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return false;
+
+		std::lock_guard lock(s_state_mutex);
+		draw_state &state = s_command_states[cmd_list];
+		state.render_targets.clear();
+		if (count != 0 && rts != nullptr)
+		{
+			state.render_targets.reserve(count);
+			for (uint32_t i = 0; i < count; ++i)
+				state.render_targets.push_back(rts[i].view);
+		}
+		state.render_target = !state.render_targets.empty() && state.render_targets[0] != 0 ? cmd_list->get_device()->get_resource_from_view(state.render_targets[0]) : resource {};
+		state.depth_stencil = ds != nullptr ? ds->view : resource_view {};
+		state.in_render_pass = true;
+		return false;
+	}
+
+	bool on_end_render_pass(command_list *cmd_list)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return false;
+
+		std::lock_guard lock(s_state_mutex);
+		const auto it = s_command_states.find(cmd_list);
+		if (it == s_command_states.end())
+			return false;
+		it->second.render_targets.clear();
+		it->second.render_target = {};
+		it->second.depth_stencil = {};
+		it->second.in_render_pass = false;
+		return false;
+	}
+
+	void on_bind_pipeline_states(command_list *cmd_list, uint32_t count, const dynamic_state *states, const uint32_t *values)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state() || states == nullptr || values == nullptr)
+			return;
+
+		std::lock_guard lock(s_state_mutex);
+		draw_state &state = s_command_states[cmd_list];
+		for (uint32_t i = 0; i < count; ++i)
+			if (states[i] == dynamic_state::primitive_topology)
+				state.topology = static_cast<primitive_topology>(values[i]);
+	}
+
+	void on_bind_viewports(command_list *cmd_list, uint32_t first, uint32_t count, const viewport *viewports)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return;
+
+		std::lock_guard lock(s_state_mutex);
+		draw_state &state = s_command_states[cmd_list];
+		if (first == 0 && count == 0)
+		{
+			state.viewports.clear();
+			return;
+		}
+		if (viewports == nullptr)
+			return;
+		if (state.viewports.size() < first + count)
+			state.viewports.resize(first + count);
+		std::copy(viewports, viewports + count, state.viewports.begin() + first);
+	}
+
+	void on_bind_scissor_rects(command_list *cmd_list, uint32_t first, uint32_t count, const rect *rects)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return;
+
+		std::lock_guard lock(s_state_mutex);
+		draw_state &state = s_command_states[cmd_list];
+		if (first == 0 && count == 0)
+		{
+			state.scissors.clear();
+			return;
+		}
+		if (rects == nullptr)
+			return;
+		if (state.scissors.size() < first + count)
+			state.scissors.resize(first + count);
+		std::copy(rects, rects + count, state.scissors.begin() + first);
 	}
 
 	void on_bind_pipeline(command_list *cmd_list, pipeline_stage, pipeline pipeline)
 	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return;
+
 		std::lock_guard lock(s_state_mutex);
 		s_command_states[cmd_list].current_pipeline = pipeline;
 	}
@@ -335,6 +493,36 @@ namespace
 			query->Release();
 			query = nullptr;
 		}
+	}
+
+	bool ensure_d3d12_query_heap(device *query_device)
+	{
+		if (query_device == nullptr || query_device->get_api() != device_api::d3d12)
+			return false;
+
+		std::lock_guard lock(s_d3d12_query_mutex);
+		if (s_d3d12_query_device == query_device && s_d3d12_query_heap != 0)
+			return true;
+
+		if (s_d3d12_query_device != nullptr && s_d3d12_query_heap != 0)
+			s_d3d12_query_device->destroy_query_heap(s_d3d12_query_heap);
+		s_d3d12_query_device = nullptr;
+		s_d3d12_query_heap = {};
+
+		if (!query_device->create_query_heap(query_type::occlusion, s_d3d12_query_capacity, &s_d3d12_query_heap))
+			return false;
+
+		s_d3d12_query_device = query_device;
+		return true;
+	}
+
+	void destroy_d3d12_query_heap()
+	{
+		std::lock_guard lock(s_d3d12_query_mutex);
+		if (s_d3d12_query_device != nullptr && s_d3d12_query_heap != 0)
+			s_d3d12_query_device->destroy_query_heap(s_d3d12_query_heap);
+		s_d3d12_query_device = nullptr;
+		s_d3d12_query_heap = {};
 	}
 
 	bool capture_draw_match(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance, draw_match &match)
@@ -885,13 +1073,31 @@ namespace
 
 	void cleanup_probe_state(probe_state &probe, bool release_query_object)
 	{
+		if (probe.is_d3d12)
+		{
+			if (probe.api_cmd_list != nullptr)
+			{
+				if (probe.query_started && probe.api_query_heap != 0)
+					probe.api_cmd_list->end_query(probe.api_query_heap, query_type::occlusion, probe.api_query_index);
+				probe.query_started = false;
+				// The probe leaves the original RTV/DSV bound. Unbinding them before the
+				// draw makes some D3D12 drivers report zero occlusion samples, and is
+				// illegal while a render pass is active anyway.
+				probe.api_cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(probe.api_old_scissors.size()), probe.api_old_scissors.data());
+			}
+			probe = {};
+			return;
+		}
+
 		if (probe.context != nullptr)
 		{
 			if (probe.query_started && probe.candidate.query != nullptr)
 				probe.context->End(probe.candidate.query);
 			probe.query_started = false;
-			probe.context->OMSetBlendState(probe.old_blend, probe.old_blend_factor, probe.old_sample_mask);
-			probe.context->OMSetDepthStencilState(probe.old_depth_stencil, probe.old_stencil_reference);
+			if (probe.old_blend != nullptr || probe.probe_blend != nullptr)
+				probe.context->OMSetBlendState(probe.old_blend, probe.old_blend_factor, probe.old_sample_mask);
+			if (probe.old_depth_stencil != nullptr || probe.probe_depth_stencil != nullptr)
+				probe.context->OMSetDepthStencilState(probe.old_depth_stencil, probe.old_stencil_reference);
 			probe.context->RSSetScissorRects(probe.old_scissor_count, probe.old_scissors);
 			probe.context->RSSetState(probe.old_rasterizer);
 		}
@@ -906,6 +1112,92 @@ namespace
 			release_query(probe.candidate.query);
 		if (probe.device != nullptr) probe.device->Release();
 		probe = {};
+	}
+
+	bool begin_d3d12_center_probe(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance, const draw_state &state, uint64_t draw_order, probe_state &probe)
+	{
+		device *api_device = cmd_list != nullptr ? cmd_list->get_device() : nullptr;
+		const bool has_render_target = std::any_of(state.render_targets.cbegin(), state.render_targets.cend(), [](const resource_view view) { return view != 0; });
+		if (api_device == nullptr || api_device->get_api() != device_api::d3d12 ||
+			(!has_render_target && state.depth_stencil == 0) || state.viewports.empty() ||
+			draw_order >= s_d3d12_query_capacity || !ensure_d3d12_query_heap(api_device))
+			return false;
+
+		const viewport &current_viewport = state.viewports[0];
+		if (current_viewport.width < 1.0f || current_viewport.height < 1.0f)
+			return false;
+
+		// DX12 draw passes frequently use intermediate render targets, omit a DSV,
+		// or leave the scissor state at its default. Use the center of the active
+		// viewport instead of requiring it to match the swap-chain dimensions
+		// (which is the DX11 path's restriction).
+		const int32_t center_x = static_cast<int32_t>(current_viewport.x + current_viewport.width * 0.5f);
+		const int32_t center_y = static_cast<int32_t>(current_viewport.y + current_viewport.height * 0.5f);
+		if (center_x < static_cast<int32_t>(current_viewport.x) || center_x >= static_cast<int32_t>(current_viewport.x + current_viewport.width) ||
+			center_y < static_cast<int32_t>(current_viewport.y) || center_y >= static_cast<int32_t>(current_viewport.y + current_viewport.height))
+			return false;
+		if (!state.scissors.empty())
+		{
+			bool inside_scissor = false;
+			for (const rect &scissor : state.scissors)
+				inside_scissor |= center_x >= scissor.left && center_x < scissor.right && center_y >= scissor.top && center_y < scissor.bottom;
+			if (!inside_scissor)
+				return false;
+		}
+
+		probe = {};
+		probe.is_d3d12 = true;
+		probe.api_cmd_list = cmd_list;
+		probe.api_device = api_device;
+		probe.api_query_heap = s_d3d12_query_heap;
+		probe.api_query_index = static_cast<uint32_t>(draw_order);
+		probe.old_render_targets = state.render_targets;
+		probe.api_old_depth_stencil = state.depth_stencil;
+		probe.api_old_scissors = state.scissors;
+		probe.api_in_render_pass = state.in_render_pass;
+		probe.api_center_x = center_x;
+		probe.api_center_y = center_y;
+		probe.candidate.index_count = index_count;
+		probe.candidate.instance_count = instance_count;
+		probe.candidate.first_index = first_index;
+		probe.candidate.vertex_offset = vertex_offset;
+		probe.candidate.first_instance = first_instance;
+		probe.candidate.topology = static_cast<D3D11_PRIMITIVE_TOPOLOGY>(state.topology);
+		probe.candidate.api_query_heap = probe.api_query_heap;
+		probe.candidate.api_query_index = probe.api_query_index;
+
+		// Do not modify the application draw here. The center probe is replayed from
+		// the after-draw callback, otherwise the original draw itself would be
+		// scissored to one pixel and cause a visible flash in the game.
+		return true;
+	}
+
+	void replay_d3d12_center_probe(command_list *cmd_list, probe_state &probe)
+	{
+		if (cmd_list == nullptr || !probe.is_d3d12 || probe.api_query_heap == 0 || probe.api_query_index == UINT32_MAX)
+			return;
+
+		const rect center_rect = { probe.api_center_x, probe.api_center_y, probe.api_center_x + 1, probe.api_center_y + 1 };
+		cmd_list->bind_scissor_rects(0, 1, &center_rect);
+
+		// Outside a native render pass, unbind application outputs for the replay.
+		// This keeps the probe from writing color/depth while the occlusion query
+		// still counts rasterized samples. Render-pass attachments cannot legally be
+		// changed in the middle of a pass, so keep those bound in that case.
+		if (!probe.api_in_render_pass)
+			cmd_list->bind_render_targets_and_depth_stencil(0, nullptr, {});
+
+		cmd_list->begin_query(probe.api_query_heap, query_type::occlusion, probe.api_query_index);
+		probe.query_started = true;
+		s_in_center_probe = true;
+		cmd_list->draw_indexed(probe.candidate.index_count, probe.candidate.instance_count, probe.candidate.first_index, probe.candidate.vertex_offset, probe.candidate.first_instance);
+		s_in_center_probe = false;
+		cmd_list->end_query(probe.api_query_heap, query_type::occlusion, probe.api_query_index);
+		probe.query_started = false;
+
+		if (!probe.api_in_render_pass)
+			cmd_list->bind_render_targets_and_depth_stencil(static_cast<uint32_t>(probe.old_render_targets.size()), probe.old_render_targets.data(), probe.api_old_depth_stencil);
+		cmd_list->bind_scissor_rects(0, static_cast<uint32_t>(probe.api_old_scissors.size()), probe.api_old_scissors.data());
 	}
 
 	const char *topology_text(D3D11_PRIMITIVE_TOPOLOGY topology)
@@ -948,20 +1240,21 @@ namespace
 		}
 	}
 
-	bool begin_center_probe(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance, const draw_state &state, probe_state &probe)
+	bool begin_center_probe(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance, const draw_state &state, uint64_t draw_order, probe_state &probe)
 	{
 		if constexpr (!s_enable_native_center_probe)
 			return false;
+		if (cmd_list != nullptr && cmd_list->get_device()->get_api() == device_api::d3d12)
+			return begin_d3d12_center_probe(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance, state, draw_order, probe);
 		if (cmd_list->get_device()->get_api() != device_api::d3d11)
 			return false;
 
 		ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd_list->get_native()));
 		if (context == nullptr)
 			return false;
-		// The picker temporarily changes rasterizer/output-merger state and
-		// replays the draw in the after_draw callback. That is only safe on the
-		// immediate context. Never mutate a deferred command list, since doing
-		// so can corrupt the application's recorded command stream.
+		// The picker temporarily changes rasterizer state around the draw. Never
+		// mutate a deferred command list, since doing so can corrupt the recorded
+		// command stream.
 		if (context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
 			return false;
 
@@ -973,10 +1266,7 @@ namespace
 		D3D11_VIEWPORT viewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
 		UINT viewport_count = ARRAYSIZE(viewports);
 		context->RSGetViewports(&viewport_count, viewports);
-		const uint32_t target_width = s_pick_target_width.load(std::memory_order_relaxed);
-		const uint32_t target_height = s_pick_target_height.load(std::memory_order_relaxed);
-		if (viewport_count == 0 || viewports[0].Width < 1.0f || viewports[0].Height < 1.0f || target_width == 0 || target_height == 0 ||
-			static_cast<uint32_t>(viewports[0].Width + 0.5f) != target_width || static_cast<uint32_t>(viewports[0].Height + 0.5f) != target_height)
+		if (viewport_count == 0 || viewports[0].Width < 1.0f || viewports[0].Height < 1.0f)
 		{
 			device->Release();
 			return false;
@@ -985,28 +1275,14 @@ namespace
 		ID3D11RenderTargetView *current_render_target = nullptr;
 		ID3D11DepthStencilView *current_depth_stencil_view = nullptr;
 		context->OMGetRenderTargets(1, &current_render_target, &current_depth_stencil_view);
-		ID3D11Resource *current_resource = nullptr;
-		ID3D11Texture2D *current_texture = nullptr;
-		D3D11_TEXTURE2D_DESC current_desc = {};
-		if (current_render_target != nullptr)
-		{
-			current_render_target->GetResource(&current_resource);
-			if (current_resource != nullptr)
-				current_resource->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&current_texture));
-			if (current_texture != nullptr)
-				current_texture->GetDesc(&current_desc);
-		}
-		// The scene is often rendered into an HDR/intermediate target before
-		// UE4 composites it into the swap-chain back buffer. Only matching the
-		// final back-buffer format therefore finds the full-screen triangle.
-		// Require a depth target and matching dimensions instead, which keeps
-		// scene geometry while excluding the usual post-processing pass.
-		const bool target_matches = current_depth_stencil_view != nullptr && current_texture != nullptr && current_desc.Width == target_width && current_desc.Height == target_height;
-		if (current_texture != nullptr) current_texture->Release();
-		if (current_resource != nullptr) current_resource->Release();
+		// DX11 games often render geometry into an intermediate target, use a
+		// depth-only pass, or bind no DSV for a color pass. The old implementation
+		// required a DSV and an exact swap-chain-size match, which silently skipped
+		// every draw in those games. A query only needs one active output target.
+		const bool has_output_target = current_render_target != nullptr || current_depth_stencil_view != nullptr;
 		if (current_render_target != nullptr) current_render_target->Release();
 		if (current_depth_stencil_view != nullptr) current_depth_stencil_view->Release();
-		if (!target_matches)
+		if (!has_output_target)
 		{
 			device->Release();
 			return false;
@@ -1020,10 +1296,14 @@ namespace
 		probe.candidate.vertex_offset = vertex_offset;
 		probe.candidate.first_instance = first_instance;
 
-		D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-		context->IAGetPrimitiveTopology(&topology);
-		probe.candidate.topology = topology;
-		capture_draw_match(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance, probe.candidate.match);
+		const bool observer_compatibility = is_observer_compatibility_path();
+		if (!observer_compatibility)
+		{
+			D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+			context->IAGetPrimitiveTopology(&topology);
+			probe.candidate.topology = topology;
+			capture_draw_match(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance, probe.candidate.match);
+		}
 
 		context->RSGetState(&probe.old_rasterizer);
 		D3D11_RASTERIZER_DESC rasterizer_desc = {};
@@ -1068,63 +1348,67 @@ namespace
 			return false;
 		}
 
-		context->OMGetDepthStencilState(&probe.old_depth_stencil, &probe.old_stencil_reference);
-		D3D11_DEPTH_STENCIL_DESC depth_desc = {};
-		if (probe.old_depth_stencil != nullptr)
-			probe.old_depth_stencil->GetDesc(&depth_desc);
-		// The picker is interested in geometry that covers the center, including
-		// geometry hidden behind the currently visible layer. Keep the original
-		// depth state for restoration, but disable depth/stencil tests for the
-		// one-pixel query and disable all writes.
-		depth_desc.DepthEnable = FALSE;
-		depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-		depth_desc.StencilEnable = FALSE;
-		depth_desc.StencilWriteMask = 0;
-		if (FAILED(device->CreateDepthStencilState(&depth_desc, &probe.probe_depth_stencil)))
+		if (!observer_compatibility)
 		{
-			cleanup_probe_state(probe, true);
-			return false;
-		}
+			context->OMGetDepthStencilState(&probe.old_depth_stencil, &probe.old_stencil_reference);
+			D3D11_DEPTH_STENCIL_DESC depth_desc = {};
+			if (probe.old_depth_stencil != nullptr)
+				probe.old_depth_stencil->GetDesc(&depth_desc);
+			// The picker is interested in geometry that covers the center, including
+			// geometry hidden behind the currently visible layer. Keep the original
+			// depth state for restoration, but disable depth/stencil tests for the
+			// one-pixel query and disable all writes.
+			depth_desc.DepthEnable = FALSE;
+			depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+			depth_desc.StencilEnable = FALSE;
+			depth_desc.StencilWriteMask = 0;
+			if (FAILED(device->CreateDepthStencilState(&depth_desc, &probe.probe_depth_stencil)))
+			{
+				cleanup_probe_state(probe, true);
+				return false;
+			}
 
-		context->OMGetBlendState(&probe.old_blend, probe.old_blend_factor, &probe.old_sample_mask);
-		D3D11_BLEND_DESC blend_desc = {};
-		if (probe.old_blend != nullptr)
-			probe.old_blend->GetDesc(&blend_desc);
-		blend_desc.IndependentBlendEnable = TRUE;
-		for (D3D11_RENDER_TARGET_BLEND_DESC &render_target : blend_desc.RenderTarget)
-			render_target.RenderTargetWriteMask = 0;
-		if (FAILED(device->CreateBlendState(&blend_desc, &probe.probe_blend)))
-		{
-			cleanup_probe_state(probe, true);
-			return false;
+			context->OMGetBlendState(&probe.old_blend, probe.old_blend_factor, &probe.old_sample_mask);
+			D3D11_BLEND_DESC blend_desc = {};
+			if (probe.old_blend != nullptr)
+				probe.old_blend->GetDesc(&blend_desc);
+			blend_desc.IndependentBlendEnable = TRUE;
+			for (D3D11_RENDER_TARGET_BLEND_DESC &render_target : blend_desc.RenderTarget)
+				render_target.RenderTargetWriteMask = 0;
+			if (FAILED(device->CreateBlendState(&blend_desc, &probe.probe_blend)))
+			{
+				cleanup_probe_state(probe, true);
+				return false;
+			}
 		}
 
 		const D3D11_RECT center_rect = { center_x, center_y, center_x + 1, center_y + 1 };
 		context->RSSetState(probe.probe_rasterizer);
 		context->RSSetScissorRects(1, &center_rect);
-		context->OMSetDepthStencilState(probe.probe_depth_stencil, probe.old_stencil_reference);
-		context->OMSetBlendState(probe.probe_blend, probe.old_blend_factor, probe.old_sample_mask);
+		if (!observer_compatibility)
+		{
+			context->OMSetDepthStencilState(probe.probe_depth_stencil, probe.old_stencil_reference);
+			context->OMSetBlendState(probe.probe_blend, probe.old_blend_factor, probe.old_sample_mask);
+		}
 		context->Begin(probe.candidate.query);
 		probe.query_started = true;
 		return true;
 	}
 
-	void replay_probe_draw(command_list *cmd_list, const pick_candidate &candidate)
+	bool begin_center_probe_safe(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance, const draw_state &state, uint64_t draw_order, probe_state &probe)
 	{
-		if (cmd_list == nullptr || candidate.index_count == 0 || candidate.instance_count == 0)
-			return;
-
-		// The probe draw deliberately has color/depth writes disabled. Replay the
-		// exact indexed draw after restoring the application's state so picking
-		// does not remove or darken geometry in the captured frame.
-		s_in_center_probe = true;
-		cmd_list->draw_indexed(
-			candidate.index_count,
-			candidate.instance_count,
-			candidate.first_index,
-			candidate.vertex_offset,
-			candidate.first_instance);
-		s_in_center_probe = false;
+		// Unreal can expose transient DX11 objects while a draw is being issued.
+		// Isolate native-driver faults here so a bad probe is treated as a miss.
+		__try
+		{
+			return begin_center_probe(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance, state, draw_order, probe);
+		}
+		__except (EXCEPTION_EXECUTE_HANDLER)
+		{
+			reshade::log::message(reshade::log::level::error, "Draw Filter: DX11 center probe faulted; skipping this draw.");
+			cleanup_probe_state(probe, true);
+			return false;
+		}
 	}
 
 	void on_begin_debug_event(command_list *cmd_list, const char *label)
@@ -1202,11 +1486,13 @@ namespace
 			s_active_probes.erase(it);
 		}
 
+		if (probe.is_d3d12)
+			replay_d3d12_center_probe(cmd_list, probe);
+
 		pick_candidate candidate = probe.candidate;
 		cleanup_probe_state(probe, false);
-		replay_probe_draw(cmd_list, candidate);
 		std::lock_guard lock(s_pick_mutex);
-		if (s_pick_active && !s_pick_finished && s_pending_pick.size() < 4096)
+		if (s_pick_active && !s_pick_finished)
 			s_pending_pick.push_back(candidate);
 		else
 			release_query(candidate.query);
@@ -1245,7 +1531,9 @@ namespace
 		if (!s_pick_finished)
 			return;
 
-		if (queue == nullptr || queue->get_device()->get_api() != device_api::d3d11)
+		device *queue_device = queue != nullptr ? queue->get_device() : nullptr;
+		const device_api queue_api = queue_device != nullptr ? queue_device->get_api() : static_cast<device_api>(0);
+		if (queue_device == nullptr || (queue_api != device_api::d3d11 && queue_api != device_api::d3d12))
 		{
 			s_pick_state = pick_status::unsupported;
 			s_pick_active = false;
@@ -1253,8 +1541,8 @@ namespace
 			return;
 		}
 
-		ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(queue->get_native()));
-		if (context == nullptr)
+		ID3D11DeviceContext *context = queue_api == device_api::d3d11 ? reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(queue->get_native())) : nullptr;
+		if (queue_api == device_api::d3d11 && context == nullptr)
 		{
 			s_pick_state = pick_status::unsupported;
 			s_pick_active = false;
@@ -1271,23 +1559,81 @@ namespace
 			return;
 		}
 
-		if (s_pick_wait_frames == 0)
+		if (queue_api == device_api::d3d11 && s_pick_wait_frames == 0)
 			context->Flush();
 
+		// The present queue is not guaranteed to be the same wrapped device that
+		// recorded the command list (Observer creates more than one D3D12 device).
+		// Query heaps are device-owned, so resolve them through the device that
+		// created the active picker heap instead of blindly using the present queue.
+		device *query_result_device = queue_device;
+		if (queue_api == device_api::d3d12)
+		{
+			std::lock_guard query_lock(s_d3d12_query_mutex);
+			if (s_d3d12_query_device != nullptr)
+				query_result_device = s_d3d12_query_device;
+		}
+
 		bool all_ready = true;
+		size_t ready_count = 0;
+		size_t nonzero_count = 0;
+		uint64_t max_samples = 0;
+		std::vector<uint64_t> d3d12_query_results;
+		query_heap d3d12_query_heap = {};
+		bool d3d12_query_batch_ready = false;
+		if (queue_api == device_api::d3d12 && query_result_device != nullptr)
+		{
+			uint32_t max_query_index = 0;
+			bool same_query_heap = true;
+			for (const pick_candidate &candidate : s_pending_pick)
+			{
+				if (candidate.api_query_heap == 0)
+				{
+					same_query_heap = false;
+					break;
+				}
+				if (d3d12_query_heap == 0)
+					d3d12_query_heap = candidate.api_query_heap;
+				else if (d3d12_query_heap != candidate.api_query_heap)
+					same_query_heap = false;
+				max_query_index = std::max(max_query_index, candidate.api_query_index);
+			}
+			if (same_query_heap && d3d12_query_heap != 0)
+			{
+				d3d12_query_results.resize(static_cast<size_t>(max_query_index) + 1);
+				d3d12_query_batch_ready = query_result_device->get_query_heap_results(d3d12_query_heap, query_type::occlusion, 0, static_cast<uint32_t>(d3d12_query_results.size()), d3d12_query_results.data(), sizeof(uint64_t));
+			}
+		}
 		for (pick_candidate &candidate : s_pending_pick)
 		{
-			UINT64 samples = 0;
-			const HRESULT result = context->GetData(candidate.query, &samples, sizeof(samples), D3D11_ASYNC_GETDATA_DONOTFLUSH);
-			if (result == S_FALSE)
+			uint64_t samples = 0;
+			bool ready = false;
+			if (queue_api == device_api::d3d11)
+			{
+				const HRESULT result = context->GetData(candidate.query, &samples, sizeof(samples), D3D11_ASYNC_GETDATA_DONOTFLUSH);
+				ready = result != S_FALSE;
+				if (ready)
+					samples = SUCCEEDED(result) ? samples : 0;
+			}
+			else
+			{
+				ready = d3d12_query_batch_ready && candidate.api_query_index < d3d12_query_results.size();
+				if (ready)
+					samples = d3d12_query_results[candidate.api_query_index];
+			}
+			if (!ready)
 			{
 				all_ready = false;
 				continue;
 			}
-			candidate.samples_passed = SUCCEEDED(result) ? samples : 0;
+			++ready_count;
+			max_samples = std::max(max_samples, samples);
+			if (samples != 0)
+				++nonzero_count;
+			candidate.samples_passed = samples;
 		}
 
-		if (!all_ready && s_pick_wait_frames++ < 4)
+		if (!all_ready && s_pick_wait_frames++ < 16)
 			return;
 
 		std::vector<pick_candidate> visible;
@@ -1297,14 +1643,16 @@ namespace
 
 		std::sort(visible.begin(), visible.end(), [](const pick_candidate &lhs, const pick_candidate &rhs) { return lhs.draw_order > rhs.draw_order; });
 
-		const uint32_t result_limit = static_cast<uint32_t>(std::clamp(s_pick_limit.load(std::memory_order_relaxed), 1, 32));
 		s_pick_results.clear();
+		const uint32_t result_limit = std::max(1u, s_pick_limit.load(std::memory_order_relaxed));
 		for (pick_candidate &candidate : visible)
 		{
-			candidate.query = nullptr;
-			s_pick_results.push_back(candidate);
 			if (s_pick_results.size() >= result_limit)
 				break;
+			candidate.query = nullptr;
+			candidate.api_query_heap = {};
+			candidate.api_query_index = UINT32_MAX;
+			s_pick_results.push_back(candidate);
 		}
 
 		const size_t queried_count = s_pending_pick.size();
@@ -1312,7 +1660,9 @@ namespace
 			release_query(candidate.query);
 		s_pending_pick.clear();
 		char pick_log[192] = {};
-		std::snprintf(pick_log, sizeof(pick_log), "Draw Filter center pick: %llu queried, %llu visible, %llu returned.", static_cast<unsigned long long>(queried_count), static_cast<unsigned long long>(visible.size()), static_cast<unsigned long long>(s_pick_results.size()));
+		std::snprintf(pick_log, sizeof(pick_log), "Draw Filter center pick: %llu queried, %llu ready, %llu nonzero, max samples %llu, %llu visible, %llu returned.",
+			static_cast<unsigned long long>(queried_count), static_cast<unsigned long long>(ready_count), static_cast<unsigned long long>(nonzero_count),
+			static_cast<unsigned long long>(max_samples), static_cast<unsigned long long>(visible.size()), static_cast<unsigned long long>(s_pick_results.size()));
 		reshade::log::message(reshade::log::level::info, pick_log);
 		s_pick_state = s_pick_results.empty() ? pick_status::no_result : pick_status::ready;
 		s_pick_active = false;
@@ -1326,8 +1676,6 @@ namespace
 			return false;
 		if (s_in_center_probe)
 			return false;
-
-		trace_special_draw(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
 
 		bool blocked = false;
 		bool partial_depth_rewrite_requested = false;
@@ -1433,7 +1781,7 @@ namespace
 			}
 
 			probe_state probe;
-			if (begin_center_probe(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance, state, probe))
+			if (begin_center_probe_safe(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance, state, draw_order, probe))
 			{
 				probe.candidate.draw_order = draw_order;
 				probe.candidate.event_name = std::move(event_name);
@@ -1465,12 +1813,6 @@ namespace
 
 		{
 			std::lock_guard lock(s_pick_mutex);
-			if (s_pick_requested.exchange(false, std::memory_order_relaxed))
-			{
-				s_pick_armed = true;
-				s_pick_state = pick_status::armed;
-			}
-
 			if (s_pick_active && !s_pick_finished)
 			{
 				s_pick_finished = true;
@@ -1486,6 +1828,17 @@ namespace
 
 	void on_finish_present(command_queue *queue, swapchain *)
 	{
+		// Arm only after the present has finished. Otherwise clicking the button
+		// can make the first indexed draw of ReShade's own overlay become the probe
+		// draw, which is unsafe for Unreal's DX11 context.
+		{
+			std::lock_guard lock(s_pick_mutex);
+			if (s_pick_requested.exchange(false, std::memory_order_relaxed))
+			{
+				s_pick_armed = true;
+				s_pick_state = pick_status::armed;
+			}
+		}
 		try_finish_pick(queue);
 	}
 
@@ -1507,6 +1860,7 @@ namespace
 			s_depth_mesh_targets.clear();
 		}
 		clear_partial_depth_buffers();
+		destroy_d3d12_query_heap();
 
 		std::lock_guard state_lock(s_state_mutex);
 		s_command_states.clear();
@@ -1526,7 +1880,7 @@ namespace
 		bool pick_in_progress = false;
 		{
 			std::lock_guard lock(s_pick_mutex);
-			pick_in_progress = s_pick_active || s_pick_armed;
+			pick_in_progress = s_pick_active || s_pick_armed || s_pick_requested.load(std::memory_order_relaxed);
 		}
 		if (runtime != nullptr && pick_in_progress)
 		{
@@ -1547,20 +1901,24 @@ namespace
 		ImGui::TextUnformatted("Match field: draw signature or index_count");
 		ImGui::SetItemTooltip("'Add to filter' from a center result matches one exact draw. Manual index input keeps the legacy global index_count behavior.");
 
-		const bool submitted = ImGui::InputInt("Index count", &s_input_index_count, 1, 100, ImGuiInputTextFlags_EnterReturnsTrue);
+		const uint32_t input_step = 1;
+		const uint32_t input_step_fast = 100;
+		const bool submitted = ImGui::InputScalar("Index count", ImGuiDataType_U32, &s_input_index_count, &input_step, &input_step_fast, "%u", ImGuiInputTextFlags_EnterReturnsTrue);
 		ImGui::SameLine();
 		const bool add_clicked = ImGui::Button("Add");
-		if ((submitted || add_clicked) && s_input_index_count > 0)
+		if ((submitted || add_clicked) && s_input_index_count != 0)
 		{
-			add_index_count(static_cast<uint32_t>(s_input_index_count));
+			add_index_count(s_input_index_count);
 			s_input_index_count = 0;
 		}
 
 		ImGui::Text("Skipped draws this session: %llu", static_cast<unsigned long long>(s_skipped_draws.load(std::memory_order_relaxed)));
-		int pick_limit = s_pick_limit.load(std::memory_order_relaxed);
-		if (ImGui::InputInt("Max center results", &pick_limit, 1, 4))
-			s_pick_limit.store(std::clamp(pick_limit, 1, 32), std::memory_order_relaxed);
-		ImGui::SetItemTooltip("Maximum number of indexed draw records returned by the one-shot center picker.");
+		uint32_t pick_limit = s_pick_limit.load(std::memory_order_relaxed);
+		const uint32_t pick_limit_step = 1;
+		const uint32_t pick_limit_step_fast = 32;
+		if (ImGui::InputScalar("Max center results", ImGuiDataType_U32, &pick_limit, &pick_limit_step, &pick_limit_step_fast, "%u"))
+			s_pick_limit.store(std::max(1u, pick_limit), std::memory_order_relaxed);
+		ImGui::SetItemTooltip("Maximum number of indexed draw records returned by the one-shot center picker. Default is 32; enter a larger value when needed.");
 
 		if constexpr (!s_enable_native_center_probe)
 		{
@@ -1583,12 +1941,11 @@ namespace
 				bool arm_picker = false;
 				{
 					std::lock_guard lock(s_pick_mutex);
-					if (!s_pick_active && !s_pick_armed)
+					if (!s_pick_active && !s_pick_armed && !s_pick_requested.load(std::memory_order_relaxed))
 					{
 						s_pick_results.clear();
 						s_pending_pick.clear();
-						s_pick_requested.store(false, std::memory_order_relaxed);
-						s_pick_armed = true;
+						s_pick_requested.store(true, std::memory_order_relaxed);
 						s_pick_state = pick_status::armed;
 						arm_picker = true;
 					}
@@ -1613,7 +1970,12 @@ namespace
 					ImGui::TextDisabled("Event: %s", candidate.event_name.empty() ? "No GPU event marker" : candidate.event_name.c_str());
 					ImGui::SameLine();
 					if (ImGui::SmallButton("Add to filter"))
-						add_draw_match(candidate);
+					{
+						if (candidate.match.valid)
+							add_draw_match(candidate.match);
+						else
+							add_index_count(candidate.index_count);
+					}
 					ImGui::PopID();
 				}
 			}
@@ -1702,6 +2064,12 @@ void register_addon_draw_filter()
 {
 	reshade::register_overlay(nullptr, draw_settings_overlay);
 	reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
+	reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
+	reshade::register_event<reshade::addon_event::begin_render_pass>(on_begin_render_pass);
+	reshade::register_event<reshade::addon_event::end_render_pass>(on_end_render_pass);
+	reshade::register_event<reshade::addon_event::bind_pipeline_states>(on_bind_pipeline_states);
+	reshade::register_event<reshade::addon_event::bind_viewports>(on_bind_viewports);
+	reshade::register_event<reshade::addon_event::bind_scissor_rects>(on_bind_scissor_rects);
 	reshade::register_event<reshade::addon_event::begin_debug_event>(on_begin_debug_event);
 	reshade::register_event<reshade::addon_event::end_debug_event>(on_end_debug_event);
 	reshade::register_event<reshade::addon_event::insert_debug_marker>(on_insert_debug_marker);
@@ -1714,6 +2082,12 @@ void unregister_addon_draw_filter()
 {
 	disable_center_picker_after_draw_event();
 	reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
+	reshade::unregister_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
+	reshade::unregister_event<reshade::addon_event::begin_render_pass>(on_begin_render_pass);
+	reshade::unregister_event<reshade::addon_event::end_render_pass>(on_end_render_pass);
+	reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(on_bind_pipeline_states);
+	reshade::unregister_event<reshade::addon_event::bind_viewports>(on_bind_viewports);
+	reshade::unregister_event<reshade::addon_event::bind_scissor_rects>(on_bind_scissor_rects);
 	reshade::unregister_event<reshade::addon_event::begin_debug_event>(on_begin_debug_event);
 	reshade::unregister_event<reshade::addon_event::end_debug_event>(on_end_debug_event);
 	reshade::unregister_event<reshade::addon_event::insert_debug_marker>(on_insert_debug_marker);

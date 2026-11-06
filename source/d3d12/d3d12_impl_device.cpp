@@ -1798,6 +1798,14 @@ bool reshade::d3d12::device_impl::create_query_heap(api::query_type type, uint32
 
 	query_heap_extra_data extra_data;
 	extra_data.count = count;
+	extra_data.cpu_resolve = false;
+
+	// ID3D12Device15::ResolveQueryData is a CPU-side resolve path and requires
+	// the query heap to be created with D3D12_QUERY_HEAP_FLAG_CPU_RESOLVE.
+	// Creating a regular heap and then using the CPU resolve entry point can
+	// otherwise report zero (or fail readiness) for every query.
+	com_ptr<ID3D12Device15> device15;
+	const bool supports_cpu_resolve = SUCCEEDED(_orig->QueryInterface(&device15));
 
 	D3D12_RESOURCE_DESC readback_desc = {};
 	readback_desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
@@ -1847,10 +1855,13 @@ bool reshade::d3d12::device_impl::create_query_heap(api::query_type type, uint32
 		internal_desc.Count = count;
 
 		if (com_ptr<ID3D12QueryHeap> object;
-			SUCCEEDED(_orig->CreateQueryHeap(&internal_desc, IID_PPV_ARGS(&object))))
+			SUCCEEDED(supports_cpu_resolve ?
+				device15->CreateQueryHeap1(&internal_desc, D3D12_QUERY_HEAP_FLAG_CPU_RESOLVE, IID_PPV_ARGS(&object)) :
+				_orig->CreateQueryHeap(&internal_desc, IID_PPV_ARGS(&object))))
 		{
 			extra_data.readback_resource = readback_resource.release();
 			extra_data.fences = new std::pair<ID3D12Fence *, UINT64>[count];
+			extra_data.cpu_resolve = supports_cpu_resolve;
 			for (uint32_t i = 0; i < extra_data.count; ++i)
 				// Start with fence value above the initial value, so that 'get_query_heap_results' will return false for the first frame as well
 				extra_data.fences[i] = std::make_pair(fences[i].release(), 1ull);
@@ -1892,41 +1903,49 @@ bool reshade::d3d12::device_impl::get_query_heap_results(api::query_heap heap, a
 
 	const auto heap_object = reinterpret_cast<ID3D12QueryHeap *>(heap.handle);
 
+	query_heap_extra_data extra_data;
+	UINT extra_data_size = sizeof(extra_data);
+	if (FAILED(heap_object->GetPrivateData(extra_data_guid, &extra_data_size, &extra_data)))
+		return false;
+
 	com_ptr<ID3D12Device15> device15;
-	if (SUCCEEDED(_orig->QueryInterface(&device15)))
+	if (extra_data.cpu_resolve && SUCCEEDED(_orig->QueryInterface(&device15)))
 	{
 		if (stride != get_query_size(type).first)
 			return false;
 
-		return SUCCEEDED(device15->ResolveQueryData(heap_object, convert_query_type(type), first, count, results));
+		if (SUCCEEDED(device15->ResolveQueryData(heap_object, convert_query_type(type), first, count, results)))
+			return true;
 	}
 
-	query_heap_extra_data extra_data;
-	UINT extra_data_size = sizeof(extra_data);
-	if (SUCCEEDED(heap_object->GetPrivateData(extra_data_guid, &extra_data_size, &extra_data)))
+	const std::pair<uint32_t, uint32_t> query_size_and_offset = get_query_size(type);
+	if (stride != query_size_and_offset.first || extra_data.readback_resource == nullptr)
+		return false;
+
+	// Fall back to the regular GPU resolve path when CPU resolve is unavailable
+	// or the driver does not accept the CPU resolve request. This is also needed
+	// on systems whose D3D12 runtime exposes ID3D12Device15 but does not support
+	// CPU-resolve query heaps for the active driver.
+	if (command_list_immediate_impl *const immediate = get_immediate_command_list())
 	{
-		for (size_t i = 0; i < count; ++i)
-		{
-			const std::pair<ID3D12Fence *, UINT64> &fence = extra_data.fences[i + first];
+		immediate->copy_query_heap_results(heap, type, first, count, to_handle(extra_data.readback_resource), static_cast<uint64_t>(first) * query_size_and_offset.first, query_size_and_offset.first);
+		if (!immediate->flush(true))
+			return false;
+	}
+	else
+	{
+		return false;
+	}
 
-			// Verify that the query has finished executing on the GPU
-			if (fence.first->GetCompletedValue() < fence.second)
-				return false;
-		}
-
-		const std::pair<uint32_t, uint32_t> query_size_and_offset = get_query_size(type);
-
+	{
 		const D3D12_RANGE read_range = { static_cast<SIZE_T>(first) * query_size_and_offset.first, (static_cast<SIZE_T>(first) + static_cast<SIZE_T>(count)) * query_size_and_offset.first };
 		const D3D12_RANGE write_range = { 0, 0 };
 
 		void *mapped_data = nullptr;
 		if (SUCCEEDED(ID3D12Resource_Map(extra_data.readback_resource, 0, &read_range, &mapped_data)))
 		{
-			for (size_t i = 0; i < count; ++i)
-				std::memcpy(static_cast<uint8_t *>(results) + i * stride, static_cast<uint8_t *>(mapped_data) + query_size_and_offset.second + static_cast<size_t>(first + i) * query_size_and_offset.first, std::min(stride, query_size_and_offset.first - query_size_and_offset.second));
-
+			std::memcpy(results, static_cast<uint8_t *>(mapped_data) + query_size_and_offset.second + static_cast<size_t>(first) * query_size_and_offset.first, static_cast<size_t>(count) * query_size_and_offset.first);
 			ID3D12Resource_Unmap(extra_data.readback_resource, 0, &write_range);
-
 			return true;
 		}
 	}
