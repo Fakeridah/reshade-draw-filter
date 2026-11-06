@@ -685,8 +685,6 @@ namespace
 				return false;
 			}
 		}
-		const bool blocked_draw_suppressed = blocked && arm_filter_suppression(cmd_list);
-
 		D3D11_QUERY_DESC query_desc = { D3D11_QUERY_OCCLUSION, 0 };
 		if (FAILED(device->CreateQuery(&query_desc, &probe.candidate.query)))
 		{
@@ -972,6 +970,8 @@ namespace
 					blocked = std::find_if(s_blocked_draws.cbegin(), s_blocked_draws.cend(), [&current_match](const draw_match &item) { return same_geometry_match(item, current_match); }) != s_blocked_draws.cend();
 			}
 		}
+
+		const bool blocked_draw_suppressed = blocked && arm_filter_suppression(cmd_list);
 
 		// Keep the normal filtering path identical to the original add-on. The
 		// center picker is a one-shot diagnostic operation and must not add any
