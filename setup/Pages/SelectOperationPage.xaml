@@ -43,6 +43,17 @@
           Remove ReShade, related configuration, logs and all installed effect files from the target game.
           </TextBlock>
         </RadioButton>
+        <Separator Margin="0,10" />
+        <TextBlock Text="Compatibility options (advanced):" Margin="0,0,0,3" />
+        <CheckBox x:Name="DisableD3D11On12ProxyCheckBox" Margin="0,2">
+          Bypass D3D11On12 proxy
+        </CheckBox>
+        <CheckBox x:Name="UseDXGIFactoryVtableHooksCheckBox" Margin="0,2">
+          Use DXGI factory compatibility hooks
+        </CheckBox>
+        <TextBlock Margin="0,3,0,0" TextWrapping="Wrap" Foreground="#666666">
+          Enable these options only when a game has problems with the standard DirectX proxy layer.
+        </TextBlock>
       </StackPanel>
     </Grid>
   </DockPanel>

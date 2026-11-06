@@ -13,6 +13,7 @@
 #include "hook_manager.hpp"
 #include "addon_manager.hpp"
 #include "capture_tool.hpp"
+#include "ini_file.hpp"
 
 extern bool is_windows7();
 
@@ -605,6 +606,10 @@ HRESULT STDMETHODCALLTYPE IDXGIFactory2_CreateSwapChainForComposition_Impl(IDXGI
 
 static bool use_dxgi_factory_vtable_hooks()
 {
+	bool force_vtable_hooks = false;
+	if (reshade::global_config().get("APP", "UseDXGIFactoryVtableHooks", force_vtable_hooks) && force_vtable_hooks)
+		return true;
+
 	// Have to use vtable hooks when Ubisoft Connect in-game overlay is loaded, because it installs hooks on the vtable entries of every factory returned,
 	// but those hooks always call back to the original functions of the last factory returned. So if an application first creates its own factory and then an internal one is created by D3D12,
 	// any calls the application is doing end up redirected to the vtable entries of the internal factory. Should that first factory be proxied, but the internal one not, then the call chain gets messed up and things crash.
@@ -731,7 +736,13 @@ extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppF
 		__uuidof(IDXGIFactory7), // {A4966EED-76DB-44DA-84C1-EE9A7AFB20A8}
 	};
 	HRESULT hr = E_NOINTERFACE;
-	if (std::find(std::begin(iid_lookup), std::end(iid_lookup), riid) == std::end(iid_lookup))
+	if (use_dxgi_factory_vtable_hooks())
+	{
+		// Preserve the interface requested by the application when using vtable
+		// hooks. Some engines rely on the exact factory version during startup.
+		hr = trampoline(Flags, riid, ppFactory);
+	}
+	else if (std::find(std::begin(iid_lookup), std::end(iid_lookup), riid) == std::end(iid_lookup))
 	{
 		hr = trampoline(Flags, riid, ppFactory); // Fall back in case of unknown (presumed higher) interface version
 	}

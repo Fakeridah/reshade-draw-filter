@@ -1648,7 +1648,14 @@ bool reshade::runtime::load_effect(const std::filesystem::path &source_file, con
 	if (!preprocessed && (preprocess_required || (source_cached = load_effect_cache(source_file.stem().u8string() + '-' + std::to_string(_renderer_id) + '-' + std::to_string(source_hash), "i", source)) == false))
 	{
 		reshadefx::preprocessor pp;
-		pp.add_macro_definition("__RESHADE__", std::to_string(VERSION_MAJOR * 10000 + VERSION_MINOR * 100 + VERSION_REVISION));
+		// Builds from an untagged source checkout use a 0.0.0.x file version,
+		// but still implement the modern ReShade effect interface. Do not make
+		// shader packages reject these builds merely because the Git tag is absent.
+		constexpr uint32_t minimum_shader_compatibility_version = 30000;
+		const uint32_t shader_compatibility_version = std::max(
+			minimum_shader_compatibility_version,
+			static_cast<uint32_t>(VERSION_MAJOR * 10000 + VERSION_MINOR * 100 + VERSION_REVISION));
+		pp.add_macro_definition("__RESHADE__", std::to_string(shader_compatibility_version));
 		pp.add_macro_definition("__RESHADE_PERMUTATION__", permutation_index != 0 ? "1" : "0");
 		pp.add_macro_definition("__RESHADE_PERFORMANCE_MODE__", _performance_mode ? "1" : "0");
 		pp.add_macro_definition("__VENDOR__", std::to_string(_vendor_id));

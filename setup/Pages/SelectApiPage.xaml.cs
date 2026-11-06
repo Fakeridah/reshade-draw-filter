@@ -76,6 +76,16 @@ namespace ReShade.Setup.Pages
 			get => ApiOpenXR.IsChecked == true;
 			set => ApiOpenXR.IsChecked = value;
 		}
+		public bool DisableD3D11On12Proxy
+		{
+			get => DisableD3D11On12ProxyCheckBox.IsChecked == true;
+			set => DisableD3D11On12ProxyCheckBox.IsChecked = value;
+		}
+		public bool UseDXGIFactoryVtableHooks
+		{
+			get => UseDXGIFactoryVtableHooksCheckBox.IsChecked == true;
+			set => UseDXGIFactoryVtableHooksCheckBox.IsChecked = value;
+		}
 
 		private void OnHyperlinkNavigate(object sender, RequestNavigateEventArgs e)
 		{

@@ -67,6 +67,19 @@ namespace ReShade.Setup
 
 				if (i + 1 < args.Length)
 				{
+					if (args[i] == "--compat-d3d11on12")
+					{
+						currentInfo.disableD3D11On12Proxy = args[++i] == "1";
+						currentInfo.compatibilityOptionsSpecified = true;
+						continue;
+					}
+					if (args[i] == "--compat-dxgi-factory")
+					{
+						currentInfo.useDXGIFactoryVtableHooks = args[++i] == "1";
+						currentInfo.compatibilityOptionsSpecified = true;
+						continue;
+					}
+
 					if (args[i] == "--api")
 					{
 						switch (args[++i])
@@ -194,6 +207,9 @@ namespace ReShade.Setup
 		{
 			public bool is64Bit;
 			public bool isUnrealEngine;
+			public bool disableD3D11On12Proxy;
+			public bool useDXGIFactoryVtableHooks;
+			public bool compatibilityOptionsSpecified;
 			public Api targetApi;
 			public bool targetOpenXR;
 			public string targetPath, targetName;
@@ -413,6 +429,17 @@ namespace ReShade.Setup
 				}
 			});
 		}
+		void LoadCompatibilitySettings()
+		{
+			if (currentInfo.compatibilityOptionsSpecified)
+			{
+				return;
+			}
+
+			var config = new IniFile(currentInfo.configPath);
+			currentInfo.disableD3D11On12Proxy = config.GetString("APP", "DisableD3D11On12Proxy", "0") == "1";
+			currentInfo.useDXGIFactoryVtableHooks = config.GetString("APP", "UseDXGIFactoryVtableHooks", "0") == "1";
+		}
 		void UpdateStatus(string message)
 		{
 			Dispatcher.Invoke(() =>
@@ -504,6 +531,9 @@ namespace ReShade.Setup
 			{
 				startInfo.Arguments += " --api openxr";
 			}
+
+			startInfo.Arguments += " --compat-d3d11on12 " + (currentInfo.disableD3D11On12Proxy ? "1" : "0");
+			startInfo.Arguments += " --compat-dxgi-factory " + (currentInfo.useDXGIFactoryVtableHooks ? "1" : "0");
 
 			switch (currentOperation)
 			{
@@ -777,6 +807,10 @@ namespace ReShade.Setup
 				currentInfo.targetPath = targetPathRemixBridge;
 			}
 
+			// Preselect compatibility options from an existing configuration, if present.
+			currentInfo.configPath = Path.Combine(basePath, "ReShade.ini");
+			LoadCompatibilitySettings();
+
 			if (isApiVulkan)
 			{
 				currentInfo.targetApi = Api.Vulkan;
@@ -809,7 +843,9 @@ namespace ReShade.Setup
 				CurrentPage.Navigate(new SelectApiPage(currentInfo.targetName)
 				{
 					SelectedApi = currentInfo.targetApi,
-					SelectedOpenXR = currentInfo.targetOpenXR
+					SelectedOpenXR = currentInfo.targetOpenXR,
+					DisableD3D11On12Proxy = currentInfo.disableD3D11On12Proxy,
+					UseDXGIFactoryVtableHooks = currentInfo.useDXGIFactoryVtableHooks
 				});
 			});
 		}
@@ -875,6 +911,7 @@ namespace ReShade.Setup
 				currentInfo.targetApi = DirectXInstallation.SelectAutomaticApi(targetPeInfo.Modules, currentInfo.isUnrealEngine);
 
 			currentInfo.configPath = Path.Combine(basePath, "ReShade.ini");
+			LoadCompatibilitySettings();
 
 			if (currentInfo.targetApi == Api.Vulkan || currentInfo.targetOpenXR)
 			{
@@ -891,7 +928,11 @@ namespace ReShade.Setup
 					{
 						Dispatcher.Invoke(() =>
 						{
-							CurrentPage.Navigate(new SelectOperationPage());
+							CurrentPage.Navigate(new SelectOperationPage
+							{
+								DisableD3D11On12Proxy = currentInfo.disableD3D11On12Proxy,
+								UseDXGIFactoryVtableHooks = currentInfo.useDXGIFactoryVtableHooks
+							});
 						});
 					}
 					return;
@@ -941,7 +982,11 @@ namespace ReShade.Setup
 
 						Dispatcher.Invoke(() =>
 						{
-							CurrentPage.Navigate(new SelectOperationPage());
+							CurrentPage.Navigate(new SelectOperationPage
+							{
+								DisableD3D11On12Proxy = currentInfo.disableD3D11On12Proxy,
+								UseDXGIFactoryVtableHooks = currentInfo.useDXGIFactoryVtableHooks
+							});
 						});
 					}
 					else
@@ -966,7 +1011,11 @@ namespace ReShade.Setup
 					{
 						Dispatcher.Invoke(() =>
 						{
-							CurrentPage.Navigate(new SelectOperationPage());
+							CurrentPage.Navigate(new SelectOperationPage
+							{
+								DisableD3D11On12Proxy = currentInfo.disableD3D11On12Proxy,
+								UseDXGIFactoryVtableHooks = currentInfo.useDXGIFactoryVtableHooks
+							});
 						});
 					}
 					return;
@@ -1307,6 +1356,10 @@ In that event here are some steps you can try to resolve this:
 				config.SetValue("PROXY", "EnableProxyLibrary", "0");
 				config.SetValue("PROXY", "ProxyLibrary", "");
 			}
+
+			// Store the advanced DirectX compatibility options selected in Setup.
+			config.SetValue("APP", "DisableD3D11On12Proxy", currentInfo.disableD3D11On12Proxy ? "1" : "0");
+			config.SetValue("APP", "UseDXGIFactoryVtableHooks", currentInfo.useDXGIFactoryVtableHooks ? "1" : "0");
 
 			config.SaveFile();
 
@@ -1850,6 +1903,9 @@ In that event here are some steps you can try to resolve this:
 			{
 				currentInfo.targetApi = apiPage.SelectedApi;
 				currentInfo.targetOpenXR = apiPage.SelectedOpenXR;
+				currentInfo.disableD3D11On12Proxy = apiPage.DisableD3D11On12Proxy;
+				currentInfo.useDXGIFactoryVtableHooks = apiPage.UseDXGIFactoryVtableHooks;
+				currentInfo.compatibilityOptionsSpecified = true;
 
 				RunTaskWithExceptionHandling(InstallStep_CheckExistingInstallation);
 				return;
@@ -1858,6 +1914,9 @@ In that event here are some steps you can try to resolve this:
 			if (CurrentPage.Content is SelectOperationPage operationPage)
 			{
 				currentOperation = operationPage.SelectedOperation;
+				currentInfo.disableD3D11On12Proxy = operationPage.DisableD3D11On12Proxy;
+				currentInfo.useDXGIFactoryVtableHooks = operationPage.UseDXGIFactoryVtableHooks;
+				currentInfo.compatibilityOptionsSpecified = true;
 
 				switch (currentOperation)
 				{

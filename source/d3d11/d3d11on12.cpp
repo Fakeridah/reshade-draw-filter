@@ -12,6 +12,7 @@
 #include "d3d12/d3d12_command_queue.hpp"
 #include "dll_log.hpp" // Include late to get 'hr_to_string' helper function
 #include "hook_manager.hpp"
+#include "ini_file.hpp"
 
 extern thread_local bool g_in_dxgi_runtime;
 
@@ -22,6 +23,17 @@ extern "C" HRESULT WINAPI D3D11On12CreateDevice(IUnknown *pDevice, UINT Flags, C
 	// The Steam overlay creates a D3D11on12 device during 'IDXGISwapChain::Present', which can be ignored, so return early in that case
 	if (g_in_dxgi_runtime)
 		return trampoline(pDevice, Flags, pFeatureLevels, FeatureLevels, ppCommandQueues, NumQueues, NodeMask, ppDevice, ppImmediateContext, pChosenFeatureLevel);
+
+	// Some D3D12 applications use D3D11-on-12 for their own UI or media path and
+	// do not tolerate ReShade replacing the returned D3D11 interfaces with proxy
+	// objects. Keep a per-application escape hatch that leaves this API untouched
+	// while retaining the normal D3D12 hooks used by ReShade and add-ons.
+	bool disable_proxy = false;
+	if (reshade::global_config().get("APP", "DisableD3D11On12Proxy", disable_proxy) && disable_proxy)
+	{
+		reshade::log::message(reshade::log::level::info, "Passing through D3D11On12CreateDevice because APP/DisableD3D11On12Proxy is enabled.");
+		return trampoline(pDevice, Flags, pFeatureLevels, FeatureLevels, ppCommandQueues, NumQueues, NodeMask, ppDevice, ppImmediateContext, pChosenFeatureLevel);
+	}
 
 	reshade::log::message(
 		reshade::log::level::info,
