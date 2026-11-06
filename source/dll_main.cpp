@@ -8,9 +8,11 @@
 #include "ini_file.hpp"
 #include "hook_manager.hpp"
 #include "addon_manager.hpp"
+#include "capture_tool.hpp"
 #include <Windows.h>
 #include <Psapi.h>
 #include <delayimp.h> // Delay-load helpers
+#include <string>
 
 // Export special symbol to identify modules as ReShade instances
 extern "C" __declspec(dllexport) const char *ReShadeVersion = VERSION_STRING_PRODUCT;
@@ -20,6 +22,7 @@ HMODULE g_module_handle = nullptr;
 std::filesystem::path g_reshade_dll_path;
 std::filesystem::path g_reshade_base_path;
 std::filesystem::path g_target_executable_path;
+bool g_reshade_auto_disabled = false;
 
 extern bool resolve_path(std::filesystem::path &path, std::error_code &ec, const std::filesystem::path &base);
 
@@ -91,6 +94,73 @@ std::filesystem::path get_module_path(HMODULE module)
 	return std::filesystem::path(buf, buf + GetModuleFileNameW(module, buf, ARRAYSIZE(buf)));
 }
 
+bool is_capture_tool_loaded(const reshade::ini_file &config)
+{
+	bool enabled = true;
+	config.get("GENERAL", "AutoDisableWhenCaptureTool", enabled);
+	if (!enabled)
+		return false;
+
+	// These are the modules loaded into the target process by common graphics
+	// capture/debugging tools. The GUI process name alone is intentionally not
+	// checked, since it is common to leave a capture tool open while playing.
+	static constexpr const wchar_t *default_modules[] = {
+		L"renderdoc.dll",
+		L"WinPixGpuCapturer.dll",
+		L"pixwin.dll",
+		L"Nvda.Graphics.Interception.dll",
+		L"IntelGPA.dll",
+		L"RadeonGPUProfiler.dll",
+		L"apitrace.dll",
+	};
+
+	for (const wchar_t *const module_name : default_modules)
+		if (GetModuleHandleW(module_name) != nullptr)
+			return true;
+
+	// Allow adding tool-specific module names without rebuilding ReShade.
+	// Values may be separated by commas or semicolons.
+	std::string custom_modules;
+	if (!config.get("GENERAL", "CaptureToolModules", custom_modules) || custom_modules.empty())
+		return false;
+
+	for (size_t start = 0; start < custom_modules.size(); )
+	{
+		const size_t end = custom_modules.find_first_of(",;", start);
+		std::string module_name = custom_modules.substr(start, end == std::string::npos ? end : end - start);
+
+		while (!module_name.empty() && (module_name.front() == ' ' || module_name.front() == '\t'))
+			module_name.erase(module_name.begin());
+		while (!module_name.empty() && (module_name.back() == ' ' || module_name.back() == '\t'))
+			module_name.pop_back();
+
+		if (!module_name.empty())
+		{
+			const std::wstring wide_module_name(module_name.begin(), module_name.end());
+			if (GetModuleHandleW(wide_module_name.c_str()) != nullptr)
+				return true;
+		}
+
+		if (end == std::string::npos)
+			break;
+		start = end + 1;
+	}
+
+	return false;
+}
+
+void update_capture_tool_state()
+{
+	if (!g_reshade_auto_disabled && is_capture_tool_loaded(reshade::global_config()))
+	{
+		g_reshade_auto_disabled = true;
+#if RESHADE_ADDON == 1
+		reshade::addon_enabled = false;
+#endif
+		reshade::log::message(reshade::log::level::warning, "A graphics capture tool was detected after ReShade loaded. ReShade effects, add-ons and proxy objects will be disabled for this process.");
+	}
+}
+
 #ifndef RESHADE_TEST_APPLICATION
 
 #ifndef NDEBUG
@@ -125,6 +195,11 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 			g_reshade_base_path = get_base_path(default_base_to_target_executable_path);
 
 			const reshade::ini_file &config = reshade::global_config();
+			g_reshade_auto_disabled = is_capture_tool_loaded(config);
+			#if RESHADE_ADDON == 1
+			if (g_reshade_auto_disabled)
+				reshade::addon_enabled = false;
+			#endif
 
 			// When ReShade is not loaded by proxy, only actually load when a configuration file exists for the target executable
 			// This e.g. prevents loading the implicit Vulkan layer when not explicitly enabled for an application
@@ -178,6 +253,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD fdwReason, LPVOID)
 #endif
 				}
 			}
+
+			if (g_reshade_auto_disabled)
+				reshade::log::message(reshade::log::level::warning, "A graphics capture tool was detected. ReShade effects, add-ons and proxy objects will be disabled for this process.");
 
 			reshade::log::message(reshade::log::level::info,
 				"Initializing crosire's ReShade version '" VERSION_STRING_FILE "' "

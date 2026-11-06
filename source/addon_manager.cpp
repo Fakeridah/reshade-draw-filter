@@ -14,8 +14,10 @@
 
 extern void register_addon_depth();
 extern void register_addon_effect_runtime_sync();
+extern void register_addon_draw_filter();
 extern void unregister_addon_depth();
 extern void unregister_addon_effect_runtime_sync();
+extern void unregister_addon_draw_filter();
 
 extern HMODULE g_module_handle;
 
@@ -84,6 +86,10 @@ static const char *addon_event_to_string(reshade::addon_event ev)
 	case addon_event::bind_stream_output_buffers: return "bind_stream_output_buffers";
 	case addon_event::draw: return "draw";
 	case addon_event::draw_indexed: return "draw_indexed";
+	case addon_event::after_draw_indexed: return "after_draw_indexed";
+	case addon_event::begin_debug_event: return "begin_debug_event";
+	case addon_event::end_debug_event: return "end_debug_event";
+	case addon_event::insert_debug_marker: return "insert_debug_marker";
 	case addon_event::dispatch: return "dispatch";
 	case addon_event::dispatch_mesh: return "dispatch_mesh";
 	case addon_event::dispatch_rays: return "dispatch_rays";
@@ -185,6 +191,20 @@ void reshade::load_addons()
 			info.handle = g_module_handle;
 
 			register_addon_effect_runtime_sync();
+		}
+	}
+	{ addon_info &info = addon_loaded_info.emplace_back();
+		info.name = "Draw Call Filter";
+		info.description = "Blocks indexed draw calls by exact index count for offline rendering diagnostics.";
+		info.author = "ReShade";
+		info.api_version = RESHADE_API_VERSION;
+		info.external = false;
+
+		if (std::find(disabled_addons.cbegin(), disabled_addons.cend(), info.name) == disabled_addons.cend())
+		{
+			info.handle = g_module_handle;
+
+			register_addon_draw_filter();
 		}
 	}
 #endif
@@ -379,6 +399,7 @@ void reshade::unload_addons()
 #if 1
 	unregister_addon_depth();
 	unregister_addon_effect_runtime_sync();
+	unregister_addon_draw_filter();
 #endif
 
 	// Remove all unloaded add-ons

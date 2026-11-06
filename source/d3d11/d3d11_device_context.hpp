@@ -183,6 +183,9 @@ public:
 	#pragma endregion
 
 	bool check_and_upgrade_interface(REFIID riid);
+	void capture_begin_debug_event(LPCWSTR label);
+	void capture_end_debug_event();
+	void capture_insert_debug_marker(LPCWSTR label);
 
 	using device_context_impl::_orig;
 	LONG _ref = 1;

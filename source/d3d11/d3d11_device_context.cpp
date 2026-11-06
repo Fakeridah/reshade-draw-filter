@@ -11,7 +11,99 @@
 #include "com_utils.hpp"
 #include "addon_manager.hpp"
 
+#include <string>
+
 using reshade::d3d11::to_handle;
+
+namespace
+{
+	std::string convert_debug_label(LPCWSTR label)
+	{
+		if (label == nullptr || *label == L'\0')
+			return {};
+
+		const int length = WideCharToMultiByte(CP_UTF8, 0, label, -1, nullptr, 0, nullptr, nullptr);
+		if (length <= 1)
+			return {};
+
+		std::string result(static_cast<size_t>(length), '\0');
+		if (WideCharToMultiByte(CP_UTF8, 0, label, -1, result.data(), length, nullptr, nullptr) == 0)
+			return {};
+		result.pop_back();
+		return result;
+	}
+
+	bool debug_event_listener_enabled()
+	{
+#if RESHADE_ADDON
+		return reshade::has_addon_event<reshade::addon_event::begin_debug_event>() ||
+			reshade::has_addon_event<reshade::addon_event::end_debug_event>() ||
+			reshade::has_addon_event<reshade::addon_event::insert_debug_marker>();
+#else
+		return false;
+#endif
+	}
+
+	class D3D11AnnotationProxy final : public ID3DUserDefinedAnnotation
+	{
+	public:
+		D3D11AnnotationProxy(D3D11DeviceContext *owner, ID3DUserDefinedAnnotation *original) : _owner(owner), _original(original)
+		{
+			assert(_owner != nullptr && _original != nullptr);
+			_owner->AddRef();
+		}
+		~D3D11AnnotationProxy()
+		{
+			_original->Release();
+			_owner->Release();
+		}
+
+		HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void **ppvObj) override
+		{
+			if (ppvObj == nullptr)
+				return E_POINTER;
+			if (riid == __uuidof(IUnknown) || riid == __uuidof(ID3DUserDefinedAnnotation))
+			{
+				AddRef();
+				*ppvObj = this;
+				return S_OK;
+			}
+			*ppvObj = nullptr;
+			return E_NOINTERFACE;
+		}
+		ULONG STDMETHODCALLTYPE AddRef() override { return InterlockedIncrement(&_ref); }
+		ULONG STDMETHODCALLTYPE Release() override
+		{
+			const ULONG ref = InterlockedDecrement(&_ref);
+			if (ref == 0)
+				delete this;
+			return ref;
+		}
+
+		INT STDMETHODCALLTYPE BeginEvent(LPCWSTR name) override
+		{
+			_owner->capture_begin_debug_event(name);
+			return _original->BeginEvent(name);
+		}
+		INT STDMETHODCALLTYPE EndEvent() override
+		{
+			const INT result = _original->EndEvent();
+			_owner->capture_end_debug_event();
+			return result;
+		}
+		void STDMETHODCALLTYPE SetMarker(LPCWSTR name) override
+		{
+			_owner->capture_insert_debug_marker(name);
+			_original->SetMarker(name);
+		}
+		BOOL STDMETHODCALLTYPE GetStatus() override { return _original->GetStatus() || debug_event_listener_enabled() ? TRUE : FALSE; }
+
+	private:
+		LONG _ref = 1;
+		D3D11DeviceContext *_owner;
+		ID3DUserDefinedAnnotation *_original;
+	};
+}
 
 D3D11DeviceContext::D3D11DeviceContext(D3D11Device *device, ID3D11DeviceContext  *original) :
 	device_context_impl(device, original)
@@ -105,6 +197,16 @@ HRESULT STDMETHODCALLTYPE D3D11DeviceContext::QueryInterface(REFIID riid, void *
 		_orig->AddRef();
 		*ppvObj = _orig;
 		return S_OK;
+	}
+
+	if (riid == __uuidof(ID3DUserDefinedAnnotation))
+	{
+		ID3DUserDefinedAnnotation *original = nullptr;
+		if (SUCCEEDED(_orig->QueryInterface(riid, reinterpret_cast<void **>(&original))))
+		{
+			*ppvObj = new D3D11AnnotationProxy(this, original);
+			return S_OK;
+		}
 	}
 
 	// Unimplemented interfaces:
@@ -212,6 +314,10 @@ void    STDMETHODCALLTYPE D3D11DeviceContext::DrawIndexed(UINT IndexCount, UINT 
 		return;
 #endif
 	_orig->DrawIndexed(IndexCount, StartIndexLocation, BaseVertexLocation);
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::after_draw_indexed>())
+		reshade::invoke_addon_event<reshade::addon_event::after_draw_indexed>(this, IndexCount, 1, StartIndexLocation, BaseVertexLocation, 0);
+#endif
 }
 void    STDMETHODCALLTYPE D3D11DeviceContext::Draw(UINT VertexCount, UINT StartVertexLocation)
 {
@@ -341,6 +447,10 @@ void    STDMETHODCALLTYPE D3D11DeviceContext::DrawIndexedInstanced(UINT IndexCou
 		return;
 #endif
 	_orig->DrawIndexedInstanced(IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::after_draw_indexed>())
+		reshade::invoke_addon_event<reshade::addon_event::after_draw_indexed>(this, IndexCountPerInstance, InstanceCount, StartIndexLocation, BaseVertexLocation, StartInstanceLocation);
+#endif
 }
 void    STDMETHODCALLTYPE D3D11DeviceContext::DrawInstanced(UINT VertexCountPerInstance, UINT InstanceCount, UINT StartVertexLocation, UINT StartInstanceLocation)
 {
@@ -1527,18 +1637,20 @@ BOOL    STDMETHODCALLTYPE D3D11DeviceContext::IsAnnotationEnabled()
 {
 	assert(_interface_version >= 2);
 
-	return static_cast<ID3D11DeviceContext2 *>(_orig)->IsAnnotationEnabled();
+	return static_cast<ID3D11DeviceContext2 *>(_orig)->IsAnnotationEnabled() || debug_event_listener_enabled() ? TRUE : FALSE;
 }
 void    STDMETHODCALLTYPE D3D11DeviceContext::SetMarkerInt(LPCWSTR pLabel, INT Data)
 {
 	assert(_interface_version >= 2);
 
+	capture_insert_debug_marker(pLabel);
 	static_cast<ID3D11DeviceContext2 *>(_orig)->SetMarkerInt(pLabel, Data);
 }
 void    STDMETHODCALLTYPE D3D11DeviceContext::BeginEventInt(LPCWSTR pLabel, INT Data)
 {
 	assert(_interface_version >= 2);
 
+	capture_begin_debug_event(pLabel);
 	static_cast<ID3D11DeviceContext2 *>(_orig)->BeginEventInt(pLabel, Data);
 }
 void    STDMETHODCALLTYPE D3D11DeviceContext::EndEvent()
@@ -1546,6 +1658,39 @@ void    STDMETHODCALLTYPE D3D11DeviceContext::EndEvent()
 	assert(_interface_version >= 2);
 
 	static_cast<ID3D11DeviceContext2 *>(_orig)->EndEvent();
+	capture_end_debug_event();
+}
+
+void D3D11DeviceContext::capture_begin_debug_event(LPCWSTR label)
+{
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::begin_debug_event>())
+	{
+		const std::string label_utf8 = convert_debug_label(label);
+		reshade::invoke_addon_event<reshade::addon_event::begin_debug_event>(this, label_utf8.c_str());
+	}
+#else
+	UNREFERENCED_PARAMETER(label);
+#endif
+}
+void D3D11DeviceContext::capture_end_debug_event()
+{
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::end_debug_event>())
+		reshade::invoke_addon_event<reshade::addon_event::end_debug_event>(this);
+#endif
+}
+void D3D11DeviceContext::capture_insert_debug_marker(LPCWSTR label)
+{
+#if RESHADE_ADDON
+	if (reshade::has_addon_event<reshade::addon_event::insert_debug_marker>())
+	{
+		const std::string label_utf8 = convert_debug_label(label);
+		reshade::invoke_addon_event<reshade::addon_event::insert_debug_marker>(this, label_utf8.c_str());
+	}
+#else
+	UNREFERENCED_PARAMETER(label);
+#endif
 }
 
 void    STDMETHODCALLTYPE D3D11DeviceContext::Flush1(D3D11_CONTEXT_TYPE ContextType, HANDLE hEvent)

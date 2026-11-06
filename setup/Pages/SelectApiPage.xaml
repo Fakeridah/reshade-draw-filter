@@ -7,6 +7,7 @@
       d:DesignWidth="510" d:DesignHeight="638"
       Width="Auto" Height="Auto"
       FocusManager.FocusedElement="{Binding ElementName=ApiD3D9}">
+  <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
   <DockPanel>
     <TextBlock DockPanel.Dock="Top">
       <StackPanel Orientation="Horizontal">
@@ -43,6 +44,16 @@
           <Label Content="_10/11/12" FontSize="18" VerticalAlignment="Center" Foreground="#414141" />
         </StackPanel>
       </RadioButton>
+      <StackPanel Margin="24,0,0,6" IsEnabled="{Binding IsChecked, ElementName=ApiDXGI}">
+        <TextBlock Text="DirectX loading method:" Margin="0,0,0,3" />
+        <ComboBox x:Name="DirectXEntry" SelectedIndex="0" MinWidth="265">
+          <ComboBoxItem Content="Automatic (recommended)" />
+          <ComboBoxItem Content="Standard (dxgi.dll)" />
+          <ComboBoxItem Content="DirectX 11 compatibility (d3d11.dll)" />
+          <ComboBoxItem Content="DirectX 12 (d3d12.dll)" />
+          <ComboBoxItem Content="DirectX 10 (d3d10.dll)" />
+        </ComboBox>
+      </StackPanel>
       <RadioButton x:Name="ApiOpenGL" x:FieldModifier="private" VerticalContentAlignment="Center">
         <StackPanel Orientation="Horizontal" Margin="8">
           <Image Source="Resources/OpenGL.png" Height="65">
@@ -82,4 +93,5 @@
       </CheckBox>
     </StackPanel>
   </DockPanel>
+  </ScrollViewer>
 </Page>

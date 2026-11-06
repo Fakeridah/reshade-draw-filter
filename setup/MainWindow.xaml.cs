@@ -193,6 +193,7 @@ namespace ReShade.Setup
 		struct InstallInfo
 		{
 			public bool is64Bit;
+			public bool isUnrealEngine;
 			public Api targetApi;
 			public bool targetOpenXR;
 			public string targetPath, targetName;
@@ -622,11 +623,9 @@ namespace ReShade.Setup
 			UpdateStatus("Analyzing executable ...");
 
 			// In case this is the bootstrap executable of an Unreal Engine game, try and find the actual game executable for it
-			string targetPathUnrealEngine = PEInfo.ReadResourceString(currentInfo.targetPath, 201); // IDI_EXEC_FILE (see BootstrapPackagedGame.cpp in Unreal Engine source code)
-			if (!string.IsNullOrEmpty(targetPathUnrealEngine) && File.Exists(targetPathUnrealEngine = Path.GetFullPath(Path.Combine(Path.GetDirectoryName(currentInfo.targetPath), targetPathUnrealEngine))))
-			{
-				currentInfo.targetPath = targetPathUnrealEngine;
-			}
+			string targetPathUnrealEngine = DirectXInstallation.ResolveExecutablePath(currentInfo.targetPath);
+			currentInfo.isUnrealEngine = !string.Equals(currentInfo.targetPath, targetPathUnrealEngine, StringComparison.OrdinalIgnoreCase) || Path.GetFileName(targetPathUnrealEngine).Equals("UE4Game.exe", StringComparison.OrdinalIgnoreCase);
+			currentInfo.targetPath = targetPathUnrealEngine;
 
 			var info = FileVersionInfo.GetVersionInfo(currentInfo.targetPath);
 			currentInfo.targetName = info.FileDescription;
@@ -788,7 +787,7 @@ namespace ReShade.Setup
 			}
 			else if (isApiDXGI)
 			{
-				currentInfo.targetApi = Api.DXGI;
+				currentInfo.targetApi = Api.DirectXAuto;
 			}
 			else if (isApiOpenGL)
 			{
@@ -819,6 +818,13 @@ namespace ReShade.Setup
 			DownloadCompatibilityIni();
 
 			UpdateStatus("Checking installation status ...");
+
+			// Resolve UE launchers here too, including command-line installations.
+			string resolvedTarget = DirectXInstallation.ResolveExecutablePath(currentInfo.targetPath);
+			currentInfo.isUnrealEngine |= !string.Equals(currentInfo.targetPath, resolvedTarget, StringComparison.OrdinalIgnoreCase) || Path.GetFileName(resolvedTarget).Equals("UE4Game.exe", StringComparison.OrdinalIgnoreCase);
+			currentInfo.targetPath = resolvedTarget;
+			var targetPeInfo = new PEInfo(resolvedTarget);
+			currentInfo.is64Bit = targetPeInfo.Type == PEInfo.BinaryType.IMAGE_FILE_MACHINE_AMD64;
 
 			string basePath = Path.GetDirectoryName(currentInfo.targetPath);
 			string executableName = Path.GetFileName(currentInfo.targetPath);
@@ -864,6 +870,9 @@ namespace ReShade.Setup
 					}
 				}
 			}
+
+			if (currentInfo.targetApi == Api.DirectXAuto)
+				currentInfo.targetApi = DirectXInstallation.SelectAutomaticApi(targetPeInfo.Modules, currentInfo.isUnrealEngine);
 
 			currentInfo.configPath = Path.Combine(basePath, "ReShade.ini");
 

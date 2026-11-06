@@ -19,7 +19,8 @@ namespace ReShade.Setup.Pages
 		DXGI,
 		DDraw,
 		OpenGL,
-		Vulkan
+		Vulkan,
+		DirectXAuto
 	}
 
 	public partial class SelectApiPage : Page
@@ -41,7 +42,14 @@ namespace ReShade.Setup.Pages
 				}
 				if (ApiDXGI.IsChecked == true)
 				{
-					return Api.DXGI;
+					switch (DirectXEntry.SelectedIndex)
+					{
+						case 1: return Api.DXGI;
+						case 2: return Api.D3D11;
+						case 3: return Api.D3D12;
+						case 4: return Api.D3D10;
+						default: return Api.DirectXAuto;
+					}
 				}
 				if (ApiOpenGL.IsChecked == true)
 				{
@@ -57,7 +65,8 @@ namespace ReShade.Setup.Pages
 			set
 			{
 				ApiD3D9.IsChecked = value == Api.D3D9;
-				ApiDXGI.IsChecked = value == Api.D3D10 || value == Api.D3D11 || value == Api.D3D12 || value == Api.DXGI;
+				ApiDXGI.IsChecked = value == Api.D3D10 || value == Api.D3D11 || value == Api.D3D12 || value == Api.DXGI || value == Api.DirectXAuto;
+				DirectXEntry.SelectedIndex = value == Api.DXGI ? 1 : value == Api.D3D11 ? 2 : value == Api.D3D12 ? 3 : value == Api.D3D10 ? 4 : 0;
 				ApiOpenGL.IsChecked = value == Api.OpenGL;
 				ApiVulkan.IsChecked = value == Api.Vulkan;
 			}

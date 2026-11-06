@@ -6,6 +6,7 @@
 #include "runtime.hpp"
 #include "runtime_manager.hpp"
 #include "ini_file.hpp"
+#include "capture_tool.hpp"
 #include <cassert>
 #include <unordered_set>
 
@@ -14,7 +15,8 @@ static std::unordered_set<std::string> s_runtime_config_names;
 
 void reshade::create_effect_runtime(api::swapchain *swapchain, api::command_queue *graphics_queue, bool vr)
 {
-	if (graphics_queue == nullptr || swapchain->get_private_data<reshade::runtime>() != nullptr)
+	update_capture_tool_state();
+	if (g_reshade_auto_disabled || graphics_queue == nullptr || swapchain->get_private_data<reshade::runtime>() != nullptr)
 		return;
 
 	assert((graphics_queue->get_type() & api::command_queue_type::graphics) != 0);

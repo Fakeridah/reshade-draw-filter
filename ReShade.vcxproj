@@ -535,6 +535,10 @@
       <ForcedIncludeFiles>reshade.hpp;%(ForcedIncludeFiles)</ForcedIncludeFiles>
       <PreprocessorDefinitions>BUILTIN_ADDON;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ClCompile Include="examples\16-draw_filter\draw_filter_addon.cpp">
+      <ForcedIncludeFiles>reshade.hpp;%(ForcedIncludeFiles)</ForcedIncludeFiles>
+      <PreprocessorDefinitions>BUILTIN_ADDON;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Include="source\addon.cpp" />
     <ClCompile Include="source\addon_manager.cpp" />
     <ClCompile Include="source\d2d1\d2d1.cpp" />
@@ -693,6 +697,7 @@
     <ClInclude Include="res\version.h" />
     <ClInclude Include="source\addon.hpp" />
     <ClInclude Include="source\addon_manager.hpp" />
+    <ClInclude Include="source\capture_tool.hpp" />
     <ClInclude Include="source\com_ptr.hpp" />
     <ClInclude Include="source\com_utils.hpp" />
     <ClInclude Include="source\d3d10\d3d10_device.hpp" />

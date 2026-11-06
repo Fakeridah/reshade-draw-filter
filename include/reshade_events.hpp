@@ -1218,6 +1218,33 @@ namespace reshade
 		draw_indexed,
 
 		/// <summary>
+		/// Called after an indexed draw command was executed. This is an extension
+		/// event used by built-in add-ons that need to bracket the native draw
+		/// without replaying it.
+		/// <para>Callback function signature: <c>void (api::command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)</c></para>
+		/// </summary>
+		after_draw_indexed = 101,
+
+		/// <summary>
+		/// Called when a graphics API debug event is opened. This is an extension
+		/// event used by built-in add-ons to observe application GPU markers.
+		/// <para>Callback function signature: <c>void (api::command_list *cmd_list, const char *label)</c></para>
+		/// </summary>
+		begin_debug_event = 102,
+
+		/// <summary>
+		/// Called when a graphics API debug event is closed.
+		/// <para>Callback function signature: <c>void (api::command_list *cmd_list)</c></para>
+		/// </summary>
+		end_debug_event = 103,
+
+		/// <summary>
+		/// Called when a graphics API debug marker is inserted.
+		/// <para>Callback function signature: <c>void (api::command_list *cmd_list, const char *label)</c></para>
+		/// </summary>
+		insert_debug_marker = 104,
+
+		/// <summary>
 		/// Called before:
 		/// <list type="bullet">
 		/// <item><description>ID3D11DeviceContext::Dispatch</description></item>
@@ -1815,7 +1842,7 @@ namespace reshade
 		reshade_overlay_technique,
 
 #if RESHADE_ADDON
-		max = 101 // Last value used internally by ReShade to determine number of events in this enum
+		max = 105 // Last value used internally by ReShade to determine number of events in this enum
 #endif
 	};
 
@@ -1902,6 +1929,10 @@ namespace reshade
 
 	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::draw, bool, api::command_list *cmd_list, uint32_t vertex_count, uint32_t instance_count, uint32_t first_vertex, uint32_t first_instance);
 	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::draw_indexed, bool, api::command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance);
+	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::after_draw_indexed, void, api::command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance);
+	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::begin_debug_event, void, api::command_list *cmd_list, const char *label);
+	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::end_debug_event, void, api::command_list *cmd_list);
+	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::insert_debug_marker, void, api::command_list *cmd_list, const char *label);
 	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::dispatch, bool, api::command_list *cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z);
 	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::dispatch_mesh, bool, api::command_list *cmd_list, uint32_t group_count_x, uint32_t group_count_y, uint32_t group_count_z);
 	RESHADE_DEFINE_ADDON_EVENT_TRAITS(addon_event::dispatch_rays, bool, api::command_list *cmd_list, api::resource raygen, uint64_t raygen_offset, uint64_t raygen_size, api::resource miss, uint64_t miss_offset, uint64_t miss_size, uint64_t miss_stride, api::resource hit_group, uint64_t hit_group_offset, uint64_t hit_group_size, uint64_t hit_group_stride, api::resource callable, uint64_t callable_offset, uint64_t callable_size, uint64_t callable_stride, uint32_t width, uint32_t height, uint32_t depth);

@@ -9,6 +9,7 @@
 #include "dll_log.hpp" // Include late to get 'hr_to_string' helper function
 #include "hook_manager.hpp"
 #include "addon_manager.hpp"
+#include "capture_tool.hpp"
 
 // These are defined in d3d9.h, but are used as function names below
 #undef IDirect3D9_CreateDevice
@@ -425,6 +426,9 @@ HRESULT STDMETHODCALLTYPE IDirect3D9Ex_CreateDeviceEx(IDirect3D9Ex *pD3D, UINT A
 extern "C" IDirect3D9 *WINAPI Direct3DCreate9(UINT SDKVersion)
 {
 	const auto trampoline = reshade::hooks::call(Direct3DCreate9);
+	update_capture_tool_state();
+	if (g_reshade_auto_disabled)
+		return trampoline(SDKVersion);
 
 	if (g_in_d3d9_runtime)
 		return trampoline(SDKVersion);
@@ -452,6 +456,9 @@ extern "C" IDirect3D9 *WINAPI Direct3DCreate9(UINT SDKVersion)
 extern "C"     HRESULT WINAPI Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex **ppD3D)
 {
 	const auto trampoline = reshade::hooks::call(Direct3DCreate9Ex);
+	update_capture_tool_state();
+	if (g_reshade_auto_disabled)
+		return trampoline(SDKVersion, ppD3D);
 
 	if (g_in_d3d9_runtime)
 		return trampoline(SDKVersion, ppD3D);

@@ -12,6 +12,7 @@
 #include "com_utils.hpp"
 #include "hook_manager.hpp"
 #include "addon_manager.hpp"
+#include "capture_tool.hpp"
 
 extern bool is_windows7();
 
@@ -630,6 +631,10 @@ extern "C" HRESULT WINAPI CreateDXGIFactory(REFIID riid, void **ppFactory)
 }
 extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory)
 {
+	update_capture_tool_state();
+	if (g_reshade_auto_disabled)
+		return reshade::hooks::call(CreateDXGIFactory1)(riid, ppFactory);
+
 	reshade::log::message(reshade::log::level::info, "Redirecting CreateDXGIFactory1(riid = %s, ppFactory = %p) ...", reshade::log::iid_to_string(riid).c_str(), ppFactory);
 
 	const HRESULT hr = reshade::hooks::call(CreateDXGIFactory1)(riid, ppFactory);
@@ -688,6 +693,13 @@ extern "C" HRESULT WINAPI CreateDXGIFactory1(REFIID riid, void **ppFactory)
 }
 extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppFactory)
 {
+	update_capture_tool_state();
+	if (g_reshade_auto_disabled)
+	{
+		const auto trampoline = is_windows7() ? nullptr : reshade::hooks::call(CreateDXGIFactory2);
+		return trampoline != nullptr ? trampoline(Flags, riid, ppFactory) : CreateDXGIFactory1(riid, ppFactory);
+	}
+
 	reshade::log::message(
 		reshade::log::level::info,
 		"Redirecting CreateDXGIFactory2(Flags = %#x, riid = %s, ppFactory = %p) ...",
@@ -784,6 +796,9 @@ extern "C" HRESULT WINAPI CreateDXGIFactory2(UINT Flags, REFIID riid, void **ppF
 extern "C" HRESULT WINAPI DXGIGetDebugInterface1(UINT Flags, REFIID riid, void **pDebug)
 {
 	const auto trampoline = reshade::hooks::call(DXGIGetDebugInterface1);
+	update_capture_tool_state();
+	if (g_reshade_auto_disabled)
+		return trampoline != nullptr ? trampoline(Flags, riid, pDebug) : E_NOINTERFACE;
 
 	// DXGIGetDebugInterface1 is not available on Windows 7, so act as if Windows SDK is not installed
 	if (trampoline == nullptr)
@@ -795,6 +810,9 @@ extern "C" HRESULT WINAPI DXGIGetDebugInterface1(UINT Flags, REFIID riid, void *
 extern "C" HRESULT WINAPI DXGIDeclareAdapterRemovalSupport()
 {
 	const auto trampoline = reshade::hooks::call(DXGIDeclareAdapterRemovalSupport);
+	update_capture_tool_state();
+	if (g_reshade_auto_disabled)
+		return trampoline != nullptr ? trampoline() : S_OK;
 
 	// DXGIDeclareAdapterRemovalSupport is supported on Windows 10 version 1803 and up, silently ignore on older systems
 	if (trampoline == nullptr)

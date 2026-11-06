@@ -75,6 +75,7 @@
     <Compile Include="Utilities\FileOpenDialog.cs" />
     <Compile Include="Utilities\IniFile.cs" />
     <Compile Include="Utilities\PEInfo.cs" />
+    <Compile Include="Utilities\DirectXInstallation.cs" />
     <Page Include="Pages\SelectAddonsPage.xaml">
       <SubType>Designer</SubType>
       <Generator>MSBuild:Compile</Generator>
@@ -172,6 +173,8 @@
   </Target>
   <!-- Archive ReShade binaries and append them to the setup executable -->
   <Target Name="BuildAndAppendSetupArchive" AfterTargets="CopyFilesToOutputDirectory">
+    <Error Condition="!Exists('$(SolutionDir)bin\Win32\$(Configuration)\ReShade32.dll')" Text="Missing ReShade32.dll. Build Release|32-bit (or the matching configuration) before packaging setup." />
+    <Error Condition="!Exists('$(SolutionDir)bin\x64\$(Configuration)\ReShade64.dll')" Text="Missing ReShade64.dll. Build Release|64-bit (or the matching configuration) before packaging setup." />
     <Message Text="Compressing ReShade DLLs ..." Importance="high" />
     <ItemGroup>
       <Archive Include="$(SolutionDir)bin\*\$(Configuration)\ReShade*.dll" />

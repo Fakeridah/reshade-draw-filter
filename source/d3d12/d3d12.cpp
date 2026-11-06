@@ -9,6 +9,7 @@
 #include "com_utils.hpp"
 #include "hook_manager.hpp"
 #include "addon_manager.hpp"
+#include "capture_tool.hpp"
 
 std::shared_mutex g_d3d12_adapter_mutex;
 
@@ -17,6 +18,9 @@ extern thread_local bool g_in_dxgi_runtime;
 extern "C" HRESULT WINAPI D3D12CreateDevice(IUnknown *pAdapter, D3D_FEATURE_LEVEL MinimumFeatureLevel, REFIID riid, void **ppDevice)
 {
 	const auto trampoline = reshade::hooks::call(D3D12CreateDevice);
+	update_capture_tool_state();
+	if (g_reshade_auto_disabled)
+		return trampoline(pAdapter, MinimumFeatureLevel, riid, ppDevice);
 
 	// Pass on unmodified in case this called from within 'Direct3DCreate9', which indicates that the D3D9 runtime is trying to create an internal device for D3D9on12, which should not be hooked
 	if (g_in_dxgi_runtime)
