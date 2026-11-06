@@ -6,11 +6,13 @@
 #include <imgui.h>
 #include <reshade.hpp>
 #include <d3d11.h>
+#include <d3dcompiler.h>
 
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <set>
 #include <string>
 #include <mutex>
@@ -50,10 +52,33 @@ namespace
 	};
 
 	std::vector<draw_match> s_blocked_draws;
+	// Vertex buffers can be shared between a visible pass and a depth-only pass.
+	// These targets are learned from filtered visible draws and are used only for
+	// matching depth-only draws.
+	struct depth_mesh_target
+	{
+		draw_match match = {};
+		std::vector<uint32_t> vertex_indices;
+	};
+	std::vector<depth_mesh_target> s_depth_mesh_targets;
+
+	struct partial_depth_buffer
+	{
+		uintptr_t original_index_buffer = 0;
+		uint32_t index_format = DXGI_FORMAT_UNKNOWN;
+		uint32_t index_buffer_offset = 0;
+		uint32_t draw_first_index = 0;
+		uint32_t draw_index_count = 0;
+		std::vector<std::pair<uint32_t, uint32_t>> zero_ranges;
+		ID3D11Buffer *modified_index_buffer = nullptr;
+	};
+	std::mutex s_partial_depth_mutex;
+	std::vector<partial_depth_buffer> s_partial_depth_buffers;
+	thread_local bool s_in_partial_depth_rewrite = false;
 	std::atomic_bool s_enabled = true;
 	std::atomic_uint64_t s_skipped_draws = 0;
 	int s_input_index_count = 0;
-	std::atomic_int s_pick_limit = 8;
+	std::atomic_int s_pick_limit = 32;
 	std::atomic_bool s_pick_requested = false;
 	std::atomic_uint s_pick_target_width = 0;
 	std::atomic_uint s_pick_target_height = 0;
@@ -111,18 +136,6 @@ namespace
 		bool query_started = false;
 	};
 
-	struct filter_suppression
-	{
-		ID3D11DeviceContext *context = nullptr;
-		ID3D11DepthStencilState *old_depth_stencil = nullptr;
-		ID3D11DepthStencilState *suppressed_depth_stencil = nullptr;
-		UINT old_stencil_reference = 0;
-		ID3D11BlendState *old_blend = nullptr;
-		ID3D11BlendState *suppressed_blend = nullptr;
-		FLOAT old_blend_factor[4] = {};
-		UINT old_sample_mask = 0;
-	};
-
 	enum class pick_status
 	{
 		idle,
@@ -147,8 +160,6 @@ namespace
 	std::vector<pick_candidate> s_pick_results;
 	std::mutex s_probe_mutex;
 	std::unordered_map<command_list *, probe_state> s_active_probes;
-	std::mutex s_filter_suppression_mutex;
-	std::unordered_map<command_list *, filter_suppression> s_active_filter_suppressions;
 	std::mutex s_marker_mutex;
 	std::unordered_map<command_list *, marker_state> s_marker_states;
 	std::set<resource> s_swapchain_back_buffers;
@@ -157,7 +168,107 @@ namespace
 	std::atomic_uint s_special_draw_trace_count = 0;
 	thread_local bool s_in_center_probe = false;
 
+	std::mutex s_isolated_shader_mutex;
+	ID3D11PixelShader *s_isolated_discard_pixel_shader = nullptr;
+	ID3D11DepthStencilState *s_isolated_no_depth_state = nullptr;
+
 	void add_draw_match(const draw_match &match);
+	bool capture_draw_match(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance, draw_match &match);
+
+	bool ensure_isolated_discard_pixel_shader(ID3D11DeviceContext *context)
+	{
+		std::lock_guard lock(s_isolated_shader_mutex);
+		if (s_isolated_discard_pixel_shader != nullptr && s_isolated_no_depth_state != nullptr)
+			return true;
+		if (context == nullptr)
+			return false;
+
+		ID3D11Device *device = nullptr;
+		context->GetDevice(&device);
+		if (device == nullptr)
+			return false;
+
+		if (s_isolated_no_depth_state == nullptr)
+		{
+			D3D11_DEPTH_STENCIL_DESC depth_desc = {};
+			depth_desc.DepthEnable = FALSE;
+			depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
+			depth_desc.DepthFunc = D3D11_COMPARISON_ALWAYS;
+			depth_desc.StencilEnable = FALSE;
+			depth_desc.StencilWriteMask = 0;
+			if (FAILED(device->CreateDepthStencilState(&depth_desc, &s_isolated_no_depth_state)))
+			{
+				device->Release();
+				return false;
+			}
+		}
+
+		static constexpr char source[] = "void main() { discard; }";
+		ID3DBlob *shader_code = nullptr;
+		ID3DBlob *errors = nullptr;
+		const HRESULT compile_result = D3DCompile(
+			source, sizeof(source) - 1, "DrawFilter288Discard", nullptr, nullptr,
+			"main", "ps_5_0", D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader_code, &errors);
+		if (FAILED(compile_result))
+		{
+			const char *message = errors != nullptr ? static_cast<const char *>(errors->GetBufferPointer()) : "unknown error";
+			char log_message[512] = {};
+			std::snprintf(log_message, sizeof(log_message), "Draw Filter: failed to compile the isolated 288 discard pixel shader: %s", message);
+			reshade::log::message(reshade::log::level::error, log_message);
+			if (errors != nullptr) errors->Release();
+			device->Release();
+			return false;
+		}
+
+		const HRESULT create_result = device->CreatePixelShader(shader_code->GetBufferPointer(), shader_code->GetBufferSize(), nullptr, &s_isolated_discard_pixel_shader);
+		if (FAILED(create_result))
+			reshade::log::message(reshade::log::level::error, "Draw Filter: failed to create the isolated 288 discard pixel shader.");
+		if (errors != nullptr) errors->Release();
+		if (shader_code != nullptr) shader_code->Release();
+		device->Release();
+		return SUCCEEDED(create_result);
+	}
+
+	void destroy_isolated_discard_pixel_shader()
+	{
+		std::lock_guard lock(s_isolated_shader_mutex);
+		if (s_isolated_discard_pixel_shader != nullptr)
+		{
+			s_isolated_discard_pixel_shader->Release();
+			s_isolated_discard_pixel_shader = nullptr;
+		}
+		if (s_isolated_no_depth_state != nullptr)
+		{
+			s_isolated_no_depth_state->Release();
+			s_isolated_no_depth_state = nullptr;
+		}
+	}
+
+	bool draw_without_pixel_output(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
+	{
+		if (cmd_list == nullptr || cmd_list->get_device()->get_api() != device_api::d3d11)
+			return false;
+
+		ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd_list->get_native()));
+		if (context == nullptr || !ensure_isolated_discard_pixel_shader(context))
+			return false;
+
+		ID3D11PixelShader *old_pixel_shader = nullptr;
+		ID3D11DepthStencilState *old_depth_stencil = nullptr;
+		UINT old_stencil_reference = 0;
+		context->PSGetShader(&old_pixel_shader, nullptr, nullptr);
+		context->OMGetDepthStencilState(&old_depth_stencil, &old_stencil_reference);
+		context->PSSetShader(s_isolated_discard_pixel_shader, nullptr, 0);
+		context->OMSetDepthStencilState(s_isolated_no_depth_state, old_stencil_reference);
+		cmd_list->draw_indexed(index_count, instance_count, first_index, vertex_offset, first_instance);
+		context->OMSetDepthStencilState(old_depth_stencil, old_stencil_reference);
+		context->PSSetShader(old_pixel_shader, nullptr, 0);
+		if (old_pixel_shader != nullptr)
+			old_pixel_shader->Release();
+		if (old_depth_stencil != nullptr)
+			old_depth_stencil->Release();
+		return true;
+	}
 
 	const char *pick_status_text(const pick_status status)
 	{
@@ -176,22 +287,8 @@ namespace
 
 	void add_index_count(uint32_t index_count)
 	{
-		if (index_count == 0)
+		if (index_count != 288)
 			return;
-
-		std::vector<draw_match> recent_matches;
-		{
-			std::lock_guard lock(s_pick_mutex);
-			for (const pick_candidate &candidate : s_pick_results)
-				if (candidate.index_count == index_count && candidate.match.valid)
-					recent_matches.push_back(candidate.match);
-		}
-		if (!recent_matches.empty())
-		{
-			for (const draw_match &match : recent_matches)
-				add_draw_match(match);
-			return;
-		}
 
 		std::unique_lock lock(s_mutex);
 		if (std::find(s_blocked_index_counts.cbegin(), s_blocked_index_counts.cend(), index_count) == s_blocked_index_counts.cend())
@@ -311,6 +408,40 @@ namespace
 		return match.valid;
 	}
 
+	void hash_draw_value(uint64_t &hash, uint64_t value)
+	{
+		// FNV-1a over the little-endian bytes keeps the displayed key stable
+		// for the lifetime of this game process.
+		for (unsigned int i = 0; i < sizeof(value); ++i)
+		{
+			hash ^= static_cast<uint8_t>(value >> (i * 8));
+			hash *= 1099511628211ull;
+		}
+	}
+
+	uint64_t draw_signature_key(const draw_match &match)
+	{
+		uint64_t hash = 14695981039346656037ull;
+		hash_draw_value(hash, match.index_count);
+		hash_draw_value(hash, match.instance_count);
+		hash_draw_value(hash, match.first_index);
+		hash_draw_value(hash, static_cast<uint32_t>(match.vertex_offset));
+		hash_draw_value(hash, match.first_instance);
+		hash_draw_value(hash, match.index_buffer);
+		hash_draw_value(hash, match.index_format);
+		hash_draw_value(hash, match.index_buffer_offset);
+		hash_draw_value(hash, match.vertex_buffer);
+		hash_draw_value(hash, match.vertex_buffer_stride);
+		hash_draw_value(hash, match.vertex_buffer_offset);
+		hash_draw_value(hash, match.input_layout);
+		hash_draw_value(hash, match.vertex_shader);
+		hash_draw_value(hash, match.pixel_shader);
+		hash_draw_value(hash, match.render_target_format);
+		hash_draw_value(hash, match.depth_stencil_format);
+		hash_draw_value(hash, static_cast<uint32_t>(match.topology));
+		return hash;
+	}
+
 	bool same_geometry_match(const draw_match &lhs, const draw_match &rhs)
 	{
 		return lhs.valid && rhs.valid &&
@@ -329,14 +460,348 @@ namespace
 			lhs.topology == rhs.topology;
 	}
 
+	bool same_draw_match(const draw_match &lhs, const draw_match &rhs)
+	{
+		return same_geometry_match(lhs, rhs) &&
+			lhs.vertex_shader == rhs.vertex_shader &&
+			lhs.pixel_shader == rhs.pixel_shader &&
+			lhs.render_target_format == rhs.render_target_format &&
+			lhs.depth_stencil_format == rhs.depth_stencil_format;
+	}
+
+	bool same_vertex_buffer(const draw_match &lhs, const draw_match &rhs)
+	{
+		return lhs.valid && rhs.valid &&
+			lhs.vertex_buffer != 0 &&
+			lhs.vertex_buffer == rhs.vertex_buffer &&
+			lhs.vertex_buffer_stride == rhs.vertex_buffer_stride &&
+			lhs.vertex_buffer_offset == rhs.vertex_buffer_offset;
+	}
+
+	bool is_depth_only_draw(const draw_match &match)
+	{
+		return match.valid &&
+			match.pixel_shader == 0 &&
+			match.render_target_format == DXGI_FORMAT_UNKNOWN &&
+			match.depth_stencil_format != DXGI_FORMAT_UNKNOWN;
+	}
+
 	void add_draw_match(const draw_match &match)
 	{
 		if (!match.valid)
 			return;
 
 		std::unique_lock lock(s_mutex);
-		if (std::find_if(s_blocked_draws.cbegin(), s_blocked_draws.cend(), [&match](const draw_match &item) { return same_geometry_match(item, match); }) == s_blocked_draws.cend())
+		if (std::find_if(s_blocked_draws.cbegin(), s_blocked_draws.cend(), [&match](const draw_match &item) { return same_draw_match(item, match); }) == s_blocked_draws.cend())
 			s_blocked_draws.push_back(match);
+	}
+
+	bool read_index_values(ID3D11DeviceContext *context, ID3D11Buffer *source, DXGI_FORMAT index_format, UINT index_buffer_offset, uint32_t first_index, uint32_t index_count, std::vector<uint32_t> &values)
+	{
+		values.clear();
+		if (context == nullptr || source == nullptr || index_count == 0)
+			return false;
+
+		const uint32_t index_size = index_format == DXGI_FORMAT_R16_UINT ? 2u : index_format == DXGI_FORMAT_R32_UINT ? 4u : 0u;
+		if (index_size == 0)
+			return false;
+
+		D3D11_BUFFER_DESC source_desc = {};
+		source->GetDesc(&source_desc);
+		const uint64_t byte_start = static_cast<uint64_t>(index_buffer_offset) + static_cast<uint64_t>(first_index) * index_size;
+		const uint64_t byte_end = byte_start + static_cast<uint64_t>(index_count) * index_size;
+		if (byte_end > source_desc.ByteWidth)
+			return false;
+
+		ID3D11Device *device = nullptr;
+		context->GetDevice(&device);
+		if (device == nullptr)
+			return false;
+
+		D3D11_BUFFER_DESC staging_desc = source_desc;
+		staging_desc.Usage = D3D11_USAGE_STAGING;
+		staging_desc.BindFlags = 0;
+		staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		staging_desc.MiscFlags = 0;
+		staging_desc.StructureByteStride = 0;
+		ID3D11Buffer *staging = nullptr;
+		const HRESULT create_result = device->CreateBuffer(&staging_desc, nullptr, &staging);
+		device->Release();
+		if (FAILED(create_result))
+			return false;
+
+		context->CopyResource(staging, source);
+		D3D11_MAPPED_SUBRESOURCE mapped = {};
+		const HRESULT map_result = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+		if (FAILED(map_result))
+		{
+			staging->Release();
+			return false;
+		}
+
+		values.resize(index_count);
+		const uint8_t *bytes = static_cast<const uint8_t *>(mapped.pData) + byte_start;
+		for (uint32_t i = 0; i < index_count; ++i)
+		{
+			if (index_format == DXGI_FORMAT_R16_UINT)
+			{
+				uint16_t value = 0;
+				std::memcpy(&value, bytes + i * index_size, sizeof(value));
+				values[i] = value;
+			}
+			else
+			{
+				uint32_t value = 0;
+				std::memcpy(&value, bytes + i * index_size, sizeof(value));
+				values[i] = value;
+			}
+		}
+
+		context->Unmap(staging, 0);
+		staging->Release();
+		return true;
+	}
+
+	bool capture_depth_mesh_target(command_list *cmd_list, const draw_match &match, depth_mesh_target &target)
+	{
+		if (cmd_list == nullptr || cmd_list->get_device()->get_api() != device_api::d3d11 || !match.valid || match.vertex_buffer == 0)
+			return false;
+
+		ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd_list->get_native()));
+		if (context == nullptr)
+			return false;
+
+		ID3D11Buffer *index_buffer = nullptr;
+		DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN;
+		UINT index_buffer_offset = 0;
+		context->IAGetIndexBuffer(&index_buffer, &index_format, &index_buffer_offset);
+		if (index_buffer == nullptr || reinterpret_cast<uintptr_t>(index_buffer) != match.index_buffer || index_format != static_cast<DXGI_FORMAT>(match.index_format) || index_buffer_offset != match.index_buffer_offset)
+		{
+			if (index_buffer != nullptr)
+				index_buffer->Release();
+			return false;
+		}
+
+		std::vector<uint32_t> raw_indices;
+		const bool read_succeeded = read_index_values(context, index_buffer, index_format, index_buffer_offset, match.first_index, match.index_count, raw_indices);
+		index_buffer->Release();
+		if (!read_succeeded)
+			return false;
+
+		target = {};
+		target.match = match;
+		target.vertex_indices.reserve(raw_indices.size());
+		for (const uint32_t raw_index : raw_indices)
+		{
+			const int64_t vertex_index = static_cast<int64_t>(raw_index) + match.vertex_offset;
+			if (vertex_index >= 0 && vertex_index <= UINT32_MAX)
+				target.vertex_indices.push_back(static_cast<uint32_t>(vertex_index));
+		}
+		std::sort(target.vertex_indices.begin(), target.vertex_indices.end());
+		target.vertex_indices.erase(std::unique(target.vertex_indices.begin(), target.vertex_indices.end()), target.vertex_indices.end());
+		return !target.vertex_indices.empty();
+	}
+
+	void add_depth_mesh_target(command_list *cmd_list, const draw_match &match)
+	{
+		if (!match.valid || match.vertex_buffer == 0)
+			return;
+
+		{
+			std::shared_lock lock(s_mutex);
+			if (std::find_if(s_depth_mesh_targets.cbegin(), s_depth_mesh_targets.cend(), [&match](const depth_mesh_target &item) { return same_geometry_match(item.match, match); }) != s_depth_mesh_targets.cend())
+				return;
+		}
+
+		depth_mesh_target target;
+		if (!capture_depth_mesh_target(cmd_list, match, target))
+			return;
+
+		std::unique_lock lock(s_mutex);
+		if (std::find_if(s_depth_mesh_targets.cbegin(), s_depth_mesh_targets.cend(), [&match](const depth_mesh_target &item) { return same_geometry_match(item.match, match); }) == s_depth_mesh_targets.cend())
+			s_depth_mesh_targets.push_back(std::move(target));
+	}
+
+	void clear_partial_depth_buffers()
+	{
+		std::lock_guard lock(s_partial_depth_mutex);
+		for (partial_depth_buffer &entry : s_partial_depth_buffers)
+		{
+			if (entry.modified_index_buffer != nullptr)
+				entry.modified_index_buffer->Release();
+		}
+		s_partial_depth_buffers.clear();
+	}
+
+	bool get_depth_targets_for_draw(const draw_match &current, std::vector<depth_mesh_target> &targets)
+	{
+		targets.clear();
+		if (!current.valid || !is_depth_only_draw(current))
+			return false;
+
+		std::shared_lock lock(s_mutex);
+		for (const depth_mesh_target &target : s_depth_mesh_targets)
+		{
+			if (!same_vertex_buffer(target.match, current))
+				continue;
+			targets.push_back(target);
+		}
+		return !targets.empty();
+	}
+
+	ID3D11Buffer *get_or_create_partial_depth_buffer(ID3D11DeviceContext *context, ID3D11Buffer *original, DXGI_FORMAT index_format, UINT index_buffer_offset, uint32_t draw_first_index, uint32_t draw_index_count, const std::vector<std::pair<uint32_t, uint32_t>> &ranges)
+	{
+		if (context == nullptr || original == nullptr || ranges.empty())
+			return nullptr;
+
+		const uint32_t index_size = index_format == DXGI_FORMAT_R16_UINT ? 2u : index_format == DXGI_FORMAT_R32_UINT ? 4u : 0u;
+		if (index_size == 0)
+			return nullptr;
+
+		std::lock_guard lock(s_partial_depth_mutex);
+		for (partial_depth_buffer &entry : s_partial_depth_buffers)
+		{
+			if (entry.original_index_buffer == reinterpret_cast<uintptr_t>(original) &&
+				entry.index_format == static_cast<uint32_t>(index_format) &&
+				entry.index_buffer_offset == index_buffer_offset &&
+				entry.draw_first_index == draw_first_index &&
+				entry.draw_index_count == draw_index_count &&
+				entry.zero_ranges == ranges)
+				return entry.modified_index_buffer;
+		}
+
+		D3D11_BUFFER_DESC original_desc = {};
+		original->GetDesc(&original_desc);
+		for (const auto &[first_index, index_count] : ranges)
+		{
+			const uint64_t byte_end = static_cast<uint64_t>(index_buffer_offset) + (static_cast<uint64_t>(first_index) + index_count) * index_size;
+			if (byte_end > original_desc.ByteWidth)
+				return nullptr;
+		}
+
+		ID3D11Device *device = nullptr;
+		context->GetDevice(&device);
+		if (device == nullptr)
+			return nullptr;
+
+		D3D11_BUFFER_DESC modified_desc = original_desc;
+		modified_desc.Usage = D3D11_USAGE_DEFAULT;
+		modified_desc.CPUAccessFlags = 0;
+		modified_desc.BindFlags |= D3D11_BIND_INDEX_BUFFER;
+		ID3D11Buffer *modified = nullptr;
+		if (FAILED(device->CreateBuffer(&modified_desc, nullptr, &modified)))
+		{
+			device->Release();
+			return nullptr;
+		}
+		device->Release();
+
+		context->CopyResource(modified, original);
+		for (const auto &[first_index, index_count] : ranges)
+		{
+			const UINT byte_start = index_buffer_offset + first_index * index_size;
+			const UINT byte_end = byte_start + index_count * index_size;
+			const UINT byte_count = byte_end - byte_start;
+			std::vector<uint8_t> zero_bytes(byte_count, 0);
+			D3D11_BOX box = { byte_start, 0, 0, byte_end, 1, 1 };
+			context->UpdateSubresource(modified, 0, &box, zero_bytes.data(), 0, 0);
+		}
+
+		partial_depth_buffer entry;
+		entry.original_index_buffer = reinterpret_cast<uintptr_t>(original);
+		entry.index_format = static_cast<uint32_t>(index_format);
+		entry.index_buffer_offset = index_buffer_offset;
+		entry.draw_first_index = draw_first_index;
+		entry.draw_index_count = draw_index_count;
+		entry.zero_ranges = ranges;
+		entry.modified_index_buffer = modified;
+		s_partial_depth_buffers.push_back(std::move(entry));
+		return modified;
+	}
+
+	bool draw_depth_without_target_geometry(command_list *cmd_list, const draw_match &current, const std::vector<depth_mesh_target> &targets)
+	{
+		if (cmd_list == nullptr || cmd_list->get_device()->get_api() != device_api::d3d11 || current.topology != D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST || targets.empty())
+			return false;
+
+		ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd_list->get_native()));
+		if (context == nullptr)
+			return false;
+
+		ID3D11Buffer *original = nullptr;
+		DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN;
+		UINT index_buffer_offset = 0;
+		context->IAGetIndexBuffer(&original, &index_format, &index_buffer_offset);
+		if (original == nullptr || reinterpret_cast<uintptr_t>(original) != current.index_buffer || index_format != static_cast<DXGI_FORMAT>(current.index_format) || index_buffer_offset != current.index_buffer_offset)
+		{
+			if (original != nullptr)
+				original->Release();
+			return false;
+		}
+
+		std::vector<uint32_t> raw_indices;
+		if (!read_index_values(context, original, index_format, index_buffer_offset, current.first_index, current.index_count, raw_indices))
+		{
+			original->Release();
+			return false;
+		}
+
+		std::vector<bool> zero_indices(current.index_count, false);
+		for (uint32_t triangle = 0; triangle + 2 < current.index_count; triangle += 3)
+		{
+			bool belongs_to_target = false;
+			for (const depth_mesh_target &target : targets)
+			{
+				const int64_t vertex0 = static_cast<int64_t>(raw_indices[triangle + 0]) + current.vertex_offset;
+				const int64_t vertex1 = static_cast<int64_t>(raw_indices[triangle + 1]) + current.vertex_offset;
+				const int64_t vertex2 = static_cast<int64_t>(raw_indices[triangle + 2]) + current.vertex_offset;
+				if (vertex0 >= 0 && vertex1 >= 0 && vertex2 >= 0 &&
+					std::binary_search(target.vertex_indices.cbegin(), target.vertex_indices.cend(), static_cast<uint32_t>(vertex0)) &&
+					std::binary_search(target.vertex_indices.cbegin(), target.vertex_indices.cend(), static_cast<uint32_t>(vertex1)) &&
+					std::binary_search(target.vertex_indices.cbegin(), target.vertex_indices.cend(), static_cast<uint32_t>(vertex2)))
+				{
+					belongs_to_target = true;
+					break;
+				}
+			}
+
+			if (belongs_to_target)
+				zero_indices[triangle + 0] = zero_indices[triangle + 1] = zero_indices[triangle + 2] = true;
+		}
+
+		std::vector<std::pair<uint32_t, uint32_t>> ranges;
+		for (uint32_t i = 0; i < zero_indices.size();)
+		{
+			if (!zero_indices[i])
+			{
+				++i;
+				continue;
+			}
+			const uint32_t start = i;
+			while (i < zero_indices.size() && zero_indices[i])
+				++i;
+			ranges.emplace_back(current.first_index + start, i - start);
+		}
+		if (ranges.empty())
+		{
+			original->Release();
+			return false;
+		}
+
+		ID3D11Buffer *modified = get_or_create_partial_depth_buffer(context, original, index_format, index_buffer_offset, current.first_index, current.index_count, ranges);
+		if (modified == nullptr)
+		{
+			original->Release();
+			return false;
+		}
+
+		context->IASetIndexBuffer(modified, index_format, index_buffer_offset);
+		s_in_partial_depth_rewrite = true;
+		cmd_list->draw_indexed(current.index_count, current.instance_count, current.first_index, current.vertex_offset, current.first_instance);
+		s_in_partial_depth_rewrite = false;
+		context->IASetIndexBuffer(original, index_format, index_buffer_offset);
+		original->Release();
+		return true;
 	}
 
 	void add_draw_match(const pick_candidate &candidate)
@@ -346,9 +811,9 @@ namespace
 
 	void trace_special_draw(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 	{
-		if (index_count != 288 && index_count != 6)
+		if (index_count == 0)
 			return;
-		if (s_special_draw_trace_count.fetch_add(1, std::memory_order_relaxed) >= 96)
+		if (s_special_draw_trace_count.fetch_add(1, std::memory_order_relaxed) >= 512)
 			return;
 		if (cmd_list == nullptr || cmd_list->get_device()->get_api() != device_api::d3d11)
 			return;
@@ -364,6 +829,12 @@ namespace
 		DXGI_FORMAT index_format = DXGI_FORMAT_UNKNOWN;
 		UINT index_offset = 0;
 		context->IAGetIndexBuffer(&index_buffer, &index_format, &index_offset);
+		ID3D11Buffer *vertex_buffer = nullptr;
+		UINT vertex_stride = 0;
+		UINT vb_offset = 0;
+		context->IAGetVertexBuffers(0, 1, &vertex_buffer, &vertex_stride, &vb_offset);
+		ID3D11InputLayout *input_layout = nullptr;
+		context->IAGetInputLayout(&input_layout);
 
 		ID3D11VertexShader *vertex_shader = nullptr;
 		ID3D11PixelShader *pixel_shader = nullptr;
@@ -393,11 +864,12 @@ namespace
 		default: break;
 		}
 
-		char trace[640] = {};
+		char trace[768] = {};
 		std::snprintf(trace, sizeof(trace),
-			"Draw Filter trace: index=%u inst=%u first=%u vertex=%d first_inst=%u ctx=%s topo=%u ib=%p ib_fmt=%u ib_off=%u vs=%p ps=%p rtv_fmt=%u dsv_fmt=%u viewport=%.0fx%.0f",
+			"Draw Filter trace: index=%u inst=%u first=%u vertex=%d first_inst=%u ctx=%s topo=%u ib=%p ib_fmt=%u ib_off=%u vb=%p vb_stride=%u vb_off=%u il=%p vs=%p ps=%p rtv_fmt=%u dsv_fmt=%u viewport=%.0fx%.0f",
 			index_count, instance_count, first_index, vertex_offset, first_instance, context_type,
 			static_cast<unsigned int>(topology), static_cast<void *>(index_buffer), static_cast<unsigned int>(index_format), index_offset,
+			static_cast<void *>(vertex_buffer), vertex_stride, vb_offset, static_cast<void *>(input_layout),
 			static_cast<void *>(vertex_shader), static_cast<void *>(pixel_shader), static_cast<unsigned int>(render_target_desc.Format),
 			static_cast<unsigned int>(depth_stencil_desc.Format), viewport.Width, viewport.Height);
 		reshade::log::message(reshade::log::level::info, trace);
@@ -406,6 +878,8 @@ namespace
 		if (depth_stencil != nullptr) depth_stencil->Release();
 		if (vertex_shader != nullptr) vertex_shader->Release();
 		if (pixel_shader != nullptr) pixel_shader->Release();
+		if (input_layout != nullptr) input_layout->Release();
+		if (vertex_buffer != nullptr) vertex_buffer->Release();
 		if (index_buffer != nullptr) index_buffer->Release();
 	}
 
@@ -432,112 +906,6 @@ namespace
 			release_query(probe.candidate.query);
 		if (probe.device != nullptr) probe.device->Release();
 		probe = {};
-	}
-
-	bool begin_filter_suppression(command_list *cmd_list, filter_suppression &suppression)
-	{
-		if (cmd_list == nullptr || cmd_list->get_device()->get_api() != device_api::d3d11)
-			return false;
-
-		ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(cmd_list->get_native()));
-		if (context == nullptr || context->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE)
-			return false;
-
-		ID3D11Device *device = nullptr;
-		context->GetDevice(&device);
-		if (device == nullptr)
-			return false;
-
-		suppression.context = context;
-		context->OMGetDepthStencilState(&suppression.old_depth_stencil, &suppression.old_stencil_reference);
-		context->OMGetBlendState(&suppression.old_blend, suppression.old_blend_factor, &suppression.old_sample_mask);
-
-		D3D11_DEPTH_STENCIL_DESC depth_desc = {};
-		depth_desc.DepthEnable = FALSE;
-		depth_desc.DepthWriteMask = D3D11_DEPTH_WRITE_MASK_ZERO;
-		depth_desc.StencilEnable = FALSE;
-		depth_desc.StencilWriteMask = 0;
-		if (FAILED(device->CreateDepthStencilState(&depth_desc, &suppression.suppressed_depth_stencil)))
-		{
-			device->Release();
-			return false;
-		}
-
-		D3D11_BLEND_DESC blend_desc = {};
-		blend_desc.IndependentBlendEnable = TRUE;
-		for (D3D11_RENDER_TARGET_BLEND_DESC &render_target : blend_desc.RenderTarget)
-			render_target.RenderTargetWriteMask = 0;
-		if (FAILED(device->CreateBlendState(&blend_desc, &suppression.suppressed_blend)))
-		{
-			if (suppression.old_depth_stencil != nullptr) suppression.old_depth_stencil->Release();
-			if (suppression.old_blend != nullptr) suppression.old_blend->Release();
-			suppression = {};
-			device->Release();
-			return false;
-		}
-
-		context->OMSetDepthStencilState(suppression.suppressed_depth_stencil, suppression.old_stencil_reference);
-		context->OMSetBlendState(suppression.suppressed_blend, suppression.old_blend_factor, suppression.old_sample_mask);
-		device->Release();
-		return true;
-	}
-
-	void restore_filter_suppression(filter_suppression &suppression)
-	{
-		if (suppression.context != nullptr)
-		{
-			suppression.context->OMSetBlendState(suppression.old_blend, suppression.old_blend_factor, suppression.old_sample_mask);
-			suppression.context->OMSetDepthStencilState(suppression.old_depth_stencil, suppression.old_stencil_reference);
-		}
-		if (suppression.suppressed_blend != nullptr) suppression.suppressed_blend->Release();
-		if (suppression.old_blend != nullptr) suppression.old_blend->Release();
-		if (suppression.suppressed_depth_stencil != nullptr) suppression.suppressed_depth_stencil->Release();
-		if (suppression.old_depth_stencil != nullptr) suppression.old_depth_stencil->Release();
-		suppression = {};
-	}
-
-	void on_after_filtered_draw(command_list *cmd_list, uint32_t, uint32_t, uint32_t, int32_t, uint32_t)
-	{
-		filter_suppression suppression;
-		{
-			std::lock_guard lock(s_filter_suppression_mutex);
-			const auto it = s_active_filter_suppressions.find(cmd_list);
-			if (it == s_active_filter_suppressions.end())
-				return;
-			suppression = std::move(it->second);
-			s_active_filter_suppressions.erase(it);
-		}
-		restore_filter_suppression(suppression);
-	}
-
-	void cleanup_active_filter_suppressions()
-	{
-		std::vector<filter_suppression> suppressions;
-		{
-			std::lock_guard lock(s_filter_suppression_mutex);
-			suppressions.reserve(s_active_filter_suppressions.size());
-			for (auto &entry : s_active_filter_suppressions)
-				suppressions.emplace_back(std::move(entry.second));
-			s_active_filter_suppressions.clear();
-		}
-		for (filter_suppression &suppression : suppressions)
-			restore_filter_suppression(suppression);
-	}
-
-	bool arm_filter_suppression(command_list *cmd_list)
-	{
-		filter_suppression suppression;
-		if (!begin_filter_suppression(cmd_list, suppression))
-			return false;
-
-		std::lock_guard lock(s_filter_suppression_mutex);
-		if (s_active_filter_suppressions.find(cmd_list) != s_active_filter_suppressions.end())
-		{
-			restore_filter_suppression(suppression);
-			return false;
-		}
-		s_active_filter_suppressions.emplace(cmd_list, std::move(suppression));
-		return true;
 	}
 
 	const char *topology_text(D3D11_PRIMITIVE_TOPOLOGY topology)
@@ -685,6 +1053,7 @@ namespace
 				return false;
 			}
 		}
+
 		D3D11_QUERY_DESC query_desc = { D3D11_QUERY_OCCLUSION, 0 };
 		if (FAILED(device->CreateQuery(&query_desc, &probe.candidate.query)))
 		{
@@ -953,25 +1322,61 @@ namespace
 
 	bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
 	{
+		if (s_in_partial_depth_rewrite)
+			return false;
 		if (s_in_center_probe)
 			return false;
 
 		trace_special_draw(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance);
 
 		bool blocked = false;
+		bool partial_depth_rewrite_requested = false;
+		draw_match partial_depth_match;
+		std::vector<depth_mesh_target> partial_depth_targets;
 		if (s_enabled.load(std::memory_order_relaxed))
 		{
-			std::shared_lock lock(s_mutex);
-			blocked = std::find(s_blocked_index_counts.cbegin(), s_blocked_index_counts.cend(), index_count) != s_blocked_index_counts.cend();
-			if (!blocked && !s_blocked_draws.empty())
+			bool globally_blocked = false;
+			bool need_match = false;
 			{
-				draw_match current_match;
-				if (capture_draw_match(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance, current_match))
-					blocked = std::find_if(s_blocked_draws.cbegin(), s_blocked_draws.cend(), [&current_match](const draw_match &item) { return same_geometry_match(item, current_match); }) != s_blocked_draws.cend();
+				std::shared_lock lock(s_mutex);
+				globally_blocked = std::find(s_blocked_index_counts.cbegin(), s_blocked_index_counts.cend(), index_count) != s_blocked_index_counts.cend();
+				need_match = globally_blocked || !s_blocked_draws.empty() || !s_depth_mesh_targets.empty();
+			}
+
+			draw_match current_match;
+			bool current_match_valid = false;
+			if (need_match)
+				current_match_valid = capture_draw_match(cmd_list, index_count, instance_count, first_index, vertex_offset, first_instance, current_match);
+
+			{
+				std::shared_lock lock(s_mutex);
+				blocked = globally_blocked;
+				if (!blocked && current_match_valid && !s_blocked_draws.empty())
+					blocked = std::find_if(s_blocked_draws.cbegin(), s_blocked_draws.cend(), [&current_match](const draw_match &item) { return same_draw_match(item, current_match); }) != s_blocked_draws.cend();
+			}
+
+			// Learn the actual vertex footprint of every filtered visible draw.
+			// Its depth-only pass may use another index buffer, so matching only by
+			// vertex-buffer identity is not sufficient.
+			if (blocked && current_match_valid && !is_depth_only_draw(current_match))
+				add_depth_mesh_target(cmd_list, current_match);
+
+			// Do not skip an entire aggregated UE4 Early-Z draw. It can contain
+			// other mesh sections that share the same vertex buffer and use another
+			// index buffer. Replay it with only triangles whose vertex footprint
+			// belongs to the filtered target mesh replaced by degenerate triangles.
+			if (!blocked && current_match_valid && is_depth_only_draw(current_match) && get_depth_targets_for_draw(current_match, partial_depth_targets))
+			{
+				partial_depth_rewrite_requested = true;
+				partial_depth_match = current_match;
 			}
 		}
 
-		const bool blocked_draw_suppressed = blocked && arm_filter_suppression(cmd_list);
+		if (partial_depth_rewrite_requested && draw_depth_without_target_geometry(cmd_list, partial_depth_match, partial_depth_targets))
+		{
+			s_skipped_draws.fetch_add(1, std::memory_order_relaxed);
+			return true;
+		}
 
 		// Keep the normal filtering path identical to the original add-on. The
 		// center picker is a one-shot diagnostic operation and must not add any
@@ -986,7 +1391,7 @@ namespace
 			if (blocked)
 			{
 				s_skipped_draws.fetch_add(1, std::memory_order_relaxed);
-				return !blocked_draw_suppressed;
+				return true;
 			}
 			return false;
 		}
@@ -1043,7 +1448,7 @@ namespace
 		if (blocked)
 		{
 			s_skipped_draws.fetch_add(1, std::memory_order_relaxed);
-			return !blocked_draw_suppressed;
+			return true;
 		}
 		if (!scan_this_draw)
 			event_name.clear();
@@ -1057,7 +1462,6 @@ namespace
 		// after_draw_indexed callback. Never let the one-pixel center probe leave
 		// its temporary D3D11 state active into the next frame.
 		cleanup_active_probes();
-		cleanup_active_filter_suppressions();
 
 		{
 			std::lock_guard lock(s_pick_mutex);
@@ -1088,7 +1492,7 @@ namespace
 	void on_destroy_device(device *)
 	{
 		cleanup_active_probes();
-		cleanup_active_filter_suppressions();
+		destroy_isolated_discard_pixel_shader();
 
 		std::lock_guard pick_lock(s_pick_mutex);
 		for (pick_candidate &candidate : s_pending_pick)
@@ -1098,6 +1502,11 @@ namespace
 		s_pick_armed = false;
 		s_pick_active = false;
 		s_pick_finished = false;
+		{
+			std::unique_lock filter_lock(s_mutex);
+			s_depth_mesh_targets.clear();
+		}
+		clear_partial_depth_buffers();
 
 		std::lock_guard state_lock(s_state_mutex);
 		s_command_states.clear();
@@ -1199,7 +1608,7 @@ namespace
 				{
 					const pick_candidate &candidate = center_results[i];
 					ImGui::PushID(static_cast<int>(i));
-					ImGui::Text("#%llu  index_count=%u  instances=%u", static_cast<unsigned long long>(candidate.draw_order), candidate.index_count, candidate.instance_count);
+					ImGui::Text("Draw #%llu  Key=%016llX  index_count=%u  instances=%u", static_cast<unsigned long long>(candidate.draw_order), static_cast<unsigned long long>(draw_signature_key(candidate.match)), candidate.index_count, candidate.instance_count);
 					ImGui::TextDisabled("%s  |  Est. primitives: %u", topology_text(candidate.topology), estimate_primitive_count(candidate.topology, candidate.index_count));
 					ImGui::TextDisabled("Event: %s", candidate.event_name.empty() ? "No GPU event marker" : candidate.event_name.c_str());
 					ImGui::SameLine();
@@ -1237,6 +1646,10 @@ namespace
 					s_blocked_index_counts.erase(
 						std::remove(s_blocked_index_counts.begin(), s_blocked_index_counts.end(), index_count),
 						s_blocked_index_counts.end());
+					s_depth_mesh_targets.erase(
+						std::remove_if(s_depth_mesh_targets.begin(), s_depth_mesh_targets.end(), [index_count](const depth_mesh_target &target) { return target.match.index_count == index_count; }),
+						s_depth_mesh_targets.end());
+					clear_partial_depth_buffers();
 				}
 				ImGui::PopID();
 			}
@@ -1251,14 +1664,21 @@ namespace
 			{
 				const draw_match &match = exact_blocked[i];
 				ImGui::PushID(static_cast<int>(i));
-				ImGui::Text("index_count=%u  instances=%u", match.index_count, match.instance_count);
+				ImGui::Text("Key=%016llX  index_count=%u  instances=%u", static_cast<unsigned long long>(draw_signature_key(match)), match.index_count, match.instance_count);
 				ImGui::TextDisabled("RT=%u  Depth=%u  Topology=%u", match.render_target_format, match.depth_stencil_format, static_cast<unsigned int>(match.topology));
 				ImGui::SameLine();
 				if (ImGui::SmallButton("Remove"))
 				{
 					std::unique_lock lock(s_mutex);
 					if (i < s_blocked_draws.size())
+					{
+						const draw_match removed_match = s_blocked_draws[i];
 						s_blocked_draws.erase(s_blocked_draws.begin() + i);
+						s_depth_mesh_targets.erase(
+							std::remove_if(s_depth_mesh_targets.begin(), s_depth_mesh_targets.end(), [&removed_match](const depth_mesh_target &target) { return same_draw_match(target.match, removed_match); }),
+							s_depth_mesh_targets.end());
+						clear_partial_depth_buffers();
+					}
 				}
 				ImGui::PopID();
 			}
@@ -1271,6 +1691,8 @@ namespace
 				std::unique_lock lock(s_mutex);
 				s_blocked_index_counts.clear();
 				s_blocked_draws.clear();
+				s_depth_mesh_targets.clear();
+				clear_partial_depth_buffers();
 			}
 		}
 	}
@@ -1280,24 +1702,24 @@ void register_addon_draw_filter()
 {
 	reshade::register_overlay(nullptr, draw_settings_overlay);
 	reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
-	reshade::register_event<reshade::addon_event::after_draw_indexed>(on_after_filtered_draw);
 	reshade::register_event<reshade::addon_event::begin_debug_event>(on_begin_debug_event);
 	reshade::register_event<reshade::addon_event::end_debug_event>(on_end_debug_event);
 	reshade::register_event<reshade::addon_event::insert_debug_marker>(on_insert_debug_marker);
 	reshade::register_event<reshade::addon_event::present>(on_present);
 	reshade::register_event<reshade::addon_event::finish_present>(on_finish_present);
+	reshade::register_event<reshade::addon_event::destroy_device>(on_destroy_device);
 }
 
 void unregister_addon_draw_filter()
 {
 	disable_center_picker_after_draw_event();
 	reshade::unregister_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
-	reshade::unregister_event<reshade::addon_event::after_draw_indexed>(on_after_filtered_draw);
 	reshade::unregister_event<reshade::addon_event::begin_debug_event>(on_begin_debug_event);
 	reshade::unregister_event<reshade::addon_event::end_debug_event>(on_end_debug_event);
 	reshade::unregister_event<reshade::addon_event::insert_debug_marker>(on_insert_debug_marker);
 	reshade::unregister_event<reshade::addon_event::present>(on_present);
 	reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
+	reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
 }
 
 #ifndef BUILTIN_ADDON
