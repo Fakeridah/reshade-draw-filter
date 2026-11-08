@@ -89,6 +89,9 @@ namespace
 	std::atomic_uint s_pick_target_width = 0;
 	std::atomic_uint s_pick_target_height = 0;
 	std::atomic_uint s_pick_target_format = 0;
+	std::atomic_int s_pick_target_x = -1;
+	std::atomic_int s_pick_target_y = -1;
+	std::atomic<effect_runtime *> s_pick_runtime = nullptr;
 	// The picker brackets the real draw with a one-pixel occlusion query. It no
 	// longer replays the draw on the application's context.
 	constexpr bool s_enable_native_center_probe = true;
@@ -164,6 +167,7 @@ namespace
 	enum class pick_status
 	{
 		idle,
+		awaiting_click,
 		armed,
 		scanning,
 		waiting,
@@ -179,6 +183,9 @@ namespace
 	bool s_pick_armed = false;
 	bool s_pick_active = false;
 	bool s_pick_finished = false;
+	bool s_mouse_pick_waiting = false;
+	bool s_mouse_pick_waiting_release = false;
+	bool s_mouse_pick_last_down = false;
 	uint32_t s_pick_wait_frames = 0;
 	uint64_t s_pick_draw_order = 0;
 	std::vector<pick_candidate> s_pending_pick;
@@ -190,6 +197,7 @@ namespace
 	std::set<resource> s_swapchain_back_buffers;
 	std::unordered_map<command_list *, draw_state> s_command_states;
 	std::atomic_bool s_after_draw_event_registered = false;
+	std::atomic_bool s_reopen_overlay = false;
 	std::atomic_uint s_special_draw_trace_count = 0;
 	thread_local bool s_in_center_probe = false;
 
@@ -319,13 +327,14 @@ namespace
 	{
 		switch (status)
 		{
+		case pick_status::awaiting_click: return "Waiting for left click";
 		case pick_status::armed: return "Waiting for next frame";
-		case pick_status::scanning: return "Scanning screen center";
+		case pick_status::scanning: return "Scanning at mouse position";
 		case pick_status::waiting: return "Waiting for GPU result";
 		case pick_status::ready: return "Results ready";
-		case pick_status::no_result: return "No indexed draw covered the center";
-		case pick_status::unsupported: return "Center picking requires D3D11 or D3D12";
-		case pick_status::disabled: return "Center picking disabled for stability";
+		case pick_status::no_result: return "No indexed draw covered the clicked position";
+		case pick_status::unsupported: return "Mouse-position picking requires D3D11 or D3D12";
+		case pick_status::disabled: return "Mouse-position picking disabled for stability";
 		default: return "Idle";
 		}
 	}
@@ -1128,19 +1137,19 @@ namespace
 			return false;
 
 		// DX12 draw passes frequently use intermediate render targets, omit a DSV,
-		// or leave the scissor state at its default. Use the center of the active
-		// viewport instead of requiring it to match the swap-chain dimensions
-		// (which is the DX11 path's restriction).
-		const int32_t center_x = static_cast<int32_t>(current_viewport.x + current_viewport.width * 0.5f);
-		const int32_t center_y = static_cast<int32_t>(current_viewport.y + current_viewport.height * 0.5f);
-		if (center_x < static_cast<int32_t>(current_viewport.x) || center_x >= static_cast<int32_t>(current_viewport.x + current_viewport.width) ||
-			center_y < static_cast<int32_t>(current_viewport.y) || center_y >= static_cast<int32_t>(current_viewport.y + current_viewport.height))
+		// or leave the scissor state at its default. Use the clicked mouse position
+		// in the active viewport instead of requiring it to match the swap-chain
+		// dimensions (which is the DX11 path's restriction).
+		const int32_t pick_x = s_pick_target_x.load(std::memory_order_relaxed);
+		const int32_t pick_y = s_pick_target_y.load(std::memory_order_relaxed);
+		if (pick_x < static_cast<int32_t>(current_viewport.x) || pick_x >= static_cast<int32_t>(current_viewport.x + current_viewport.width) ||
+			pick_y < static_cast<int32_t>(current_viewport.y) || pick_y >= static_cast<int32_t>(current_viewport.y + current_viewport.height))
 			return false;
 		if (!state.scissors.empty())
 		{
 			bool inside_scissor = false;
 			for (const rect &scissor : state.scissors)
-				inside_scissor |= center_x >= scissor.left && center_x < scissor.right && center_y >= scissor.top && center_y < scissor.bottom;
+				inside_scissor |= pick_x >= scissor.left && pick_x < scissor.right && pick_y >= scissor.top && pick_y < scissor.bottom;
 			if (!inside_scissor)
 				return false;
 		}
@@ -1155,8 +1164,8 @@ namespace
 		probe.api_old_depth_stencil = state.depth_stencil;
 		probe.api_old_scissors = state.scissors;
 		probe.api_in_render_pass = state.in_render_pass;
-		probe.api_center_x = center_x;
-		probe.api_center_y = center_y;
+		probe.api_center_x = pick_x;
+		probe.api_center_y = pick_y;
 		probe.candidate.index_count = index_count;
 		probe.candidate.instance_count = instance_count;
 		probe.candidate.first_index = first_index;
@@ -1318,15 +1327,19 @@ namespace
 
 		probe.old_scissor_count = ARRAYSIZE(probe.old_scissors);
 		context->RSGetScissorRects(&probe.old_scissor_count, probe.old_scissors);
-		LONG center_x = static_cast<LONG>(viewports[0].TopLeftX + viewports[0].Width * 0.5f);
-		LONG center_y = static_cast<LONG>(viewports[0].TopLeftY + viewports[0].Height * 0.5f);
-		center_x = std::max(static_cast<LONG>(viewports[0].TopLeftX), std::min(center_x, static_cast<LONG>(viewports[0].TopLeftX + viewports[0].Width) - 1));
-		center_y = std::max(static_cast<LONG>(viewports[0].TopLeftY), std::min(center_y, static_cast<LONG>(viewports[0].TopLeftY + viewports[0].Height) - 1));
+		LONG pick_x = static_cast<LONG>(s_pick_target_x.load(std::memory_order_relaxed));
+		LONG pick_y = static_cast<LONG>(s_pick_target_y.load(std::memory_order_relaxed));
+		if (pick_x < static_cast<LONG>(viewports[0].TopLeftX) || pick_x >= static_cast<LONG>(viewports[0].TopLeftX + viewports[0].Width) ||
+			pick_y < static_cast<LONG>(viewports[0].TopLeftY) || pick_y >= static_cast<LONG>(viewports[0].TopLeftY + viewports[0].Height))
+		{
+			cleanup_probe_state(probe, false);
+			return false;
+		}
 		if (rasterizer_desc.ScissorEnable && probe.old_scissor_count != 0)
 		{
 			bool inside_scissor = false;
 			for (UINT i = 0; i < probe.old_scissor_count; ++i)
-				inside_scissor |= center_x >= probe.old_scissors[i].left && center_x < probe.old_scissors[i].right && center_y >= probe.old_scissors[i].top && center_y < probe.old_scissors[i].bottom;
+				inside_scissor |= pick_x >= probe.old_scissors[i].left && pick_x < probe.old_scissors[i].right && pick_y >= probe.old_scissors[i].top && pick_y < probe.old_scissors[i].bottom;
 			if (!inside_scissor)
 			{
 				cleanup_probe_state(probe, false);
@@ -1382,7 +1395,7 @@ namespace
 			}
 		}
 
-		const D3D11_RECT center_rect = { center_x, center_y, center_x + 1, center_y + 1 };
+		const D3D11_RECT center_rect = { pick_x, pick_y, pick_x + 1, pick_y + 1 };
 		context->RSSetState(probe.probe_rasterizer);
 		context->RSSetScissorRects(1, &center_rect);
 		if (!observer_compatibility)
@@ -1525,6 +1538,79 @@ namespace
 			cleanup_probe_state(entry.second, true);
 	}
 
+	void poll_mouse_pick_input()
+	{
+		effect_runtime *runtime = s_pick_runtime.load(std::memory_order_acquire);
+		if (runtime == nullptr)
+			return;
+
+		const bool mouse_down = runtime->is_mouse_button_down(0);
+		bool capture = false;
+		{
+			std::lock_guard lock(s_pick_mutex);
+			if (!s_mouse_pick_waiting)
+			{
+				s_mouse_pick_last_down = mouse_down;
+				return;
+			}
+
+			// Do not treat the click on the capture button as the game click. Wait
+			// until that button has been released before accepting the next press.
+			if (s_mouse_pick_waiting_release)
+			{
+				s_mouse_pick_last_down = mouse_down;
+				if (!mouse_down)
+					s_mouse_pick_waiting_release = false;
+				return;
+			}
+
+			capture = mouse_down && !s_mouse_pick_last_down;
+			s_mouse_pick_last_down = mouse_down;
+			if (capture)
+				s_mouse_pick_waiting = false;
+		}
+
+		if (!capture)
+			return;
+
+		uint32_t cursor_x = 0, cursor_y = 0;
+		runtime->get_mouse_cursor_position(&cursor_x, &cursor_y);
+		s_pick_target_x.store(static_cast<int32_t>(cursor_x), std::memory_order_relaxed);
+		s_pick_target_y.store(static_cast<int32_t>(cursor_y), std::memory_order_relaxed);
+
+		const resource_desc back_buffer_desc = runtime->get_device()->get_resource_desc(runtime->get_current_back_buffer());
+		s_pick_target_width.store(back_buffer_desc.texture.width, std::memory_order_relaxed);
+		s_pick_target_height.store(back_buffer_desc.texture.height, std::memory_order_relaxed);
+		s_pick_target_format.store(static_cast<uint32_t>(back_buffer_desc.texture.format), std::memory_order_relaxed);
+
+		{
+			std::lock_guard lock(s_pick_mutex);
+			s_pick_requested.store(true, std::memory_order_relaxed);
+			s_pick_state = pick_status::armed;
+		}
+		enable_center_picker_after_draw_event();
+	}
+
+	void reopen_overlay_if_requested()
+	{
+		if (!s_reopen_overlay.exchange(false, std::memory_order_acq_rel))
+			return;
+
+		if (effect_runtime *runtime = s_pick_runtime.load(std::memory_order_acquire); runtime != nullptr)
+			runtime->open_overlay(true, input_source::mouse);
+	}
+
+	void keep_mouse_pick_input_blocked()
+	{
+		effect_runtime *runtime = s_pick_runtime.load(std::memory_order_acquire);
+		if (runtime == nullptr)
+			return;
+
+		std::lock_guard lock(s_pick_mutex);
+		if (s_mouse_pick_waiting || s_pick_requested.load(std::memory_order_relaxed) || s_pick_armed || s_pick_active || s_pick_finished)
+			runtime->block_input_next_frame();
+	}
+
 	void try_finish_pick(command_queue *queue)
 	{
 		std::lock_guard lock(s_pick_mutex);
@@ -1538,6 +1624,7 @@ namespace
 			s_pick_state = pick_status::unsupported;
 			s_pick_active = false;
 			s_pick_finished = false;
+			s_reopen_overlay.store(true, std::memory_order_release);
 			return;
 		}
 
@@ -1547,6 +1634,7 @@ namespace
 			s_pick_state = pick_status::unsupported;
 			s_pick_active = false;
 			s_pick_finished = false;
+			s_reopen_overlay.store(true, std::memory_order_release);
 			return;
 		}
 
@@ -1556,6 +1644,7 @@ namespace
 			s_pick_state = pick_status::no_result;
 			s_pick_active = false;
 			s_pick_finished = false;
+			s_reopen_overlay.store(true, std::memory_order_release);
 			return;
 		}
 
@@ -1668,6 +1757,7 @@ namespace
 		s_pick_active = false;
 		s_pick_finished = false;
 		s_pick_wait_frames = 0;
+		s_reopen_overlay.store(true, std::memory_order_release);
 	}
 
 	bool on_draw_indexed(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance)
@@ -1828,6 +1918,9 @@ namespace
 
 	void on_finish_present(command_queue *queue, swapchain *)
 	{
+		poll_mouse_pick_input();
+		keep_mouse_pick_input_blocked();
+
 		// Arm only after the present has finished. Otherwise clicking the button
 		// can make the first indexed draw of ReShade's own overlay become the probe
 		// draw, which is unsafe for Unreal's DX11 context.
@@ -1840,6 +1933,7 @@ namespace
 			}
 		}
 		try_finish_pick(queue);
+		reopen_overlay_if_requested();
 	}
 
 	void on_destroy_device(device *)
@@ -1855,6 +1949,11 @@ namespace
 		s_pick_armed = false;
 		s_pick_active = false;
 		s_pick_finished = false;
+		s_mouse_pick_waiting = false;
+		s_mouse_pick_waiting_release = false;
+		s_mouse_pick_last_down = false;
+		s_pick_runtime.store(nullptr, std::memory_order_release);
+		s_reopen_overlay.store(false, std::memory_order_release);
 		{
 			std::unique_lock filter_lock(s_mutex);
 			s_depth_mesh_targets.clear();
@@ -1869,6 +1968,9 @@ namespace
 
 	void draw_settings_overlay(effect_runtime *runtime)
 	{
+		if (runtime != nullptr)
+			s_pick_runtime.store(runtime, std::memory_order_release);
+
 		{
 			std::lock_guard lock(s_pick_mutex);
 			if (s_pick_active && !s_pick_finished)
@@ -1880,13 +1982,13 @@ namespace
 		bool pick_in_progress = false;
 		{
 			std::lock_guard lock(s_pick_mutex);
-			pick_in_progress = s_pick_active || s_pick_armed || s_pick_requested.load(std::memory_order_relaxed);
+			pick_in_progress = s_mouse_pick_waiting || s_pick_active || s_pick_armed || s_pick_requested.load(std::memory_order_relaxed);
 		}
 		if (runtime != nullptr && pick_in_progress)
 		{
 			// Do not query the current back buffer on every overlay draw. Some UE4
 			// render paths expose transient resources here, so only inspect it for
-			// an explicitly requested center-pick operation.
+			// an explicitly requested mouse-position pick operation.
 			const resource_desc back_buffer_desc = runtime->get_device()->get_resource_desc(runtime->get_current_back_buffer());
 			s_pick_target_width.store(back_buffer_desc.texture.width, std::memory_order_relaxed);
 			s_pick_target_height.store(back_buffer_desc.texture.height, std::memory_order_relaxed);
@@ -1899,7 +2001,7 @@ namespace
 			s_enabled.store(enabled, std::memory_order_relaxed);
 
 		ImGui::TextUnformatted("Match field: draw signature or index_count");
-		ImGui::SetItemTooltip("'Add to filter' from a center result matches one exact draw. Manual index input keeps the legacy global index_count behavior.");
+		ImGui::SetItemTooltip("'Add to filter' from a mouse-position result matches one exact draw. Manual index input keeps the legacy global index_count behavior.");
 
 		const uint32_t input_step = 1;
 		const uint32_t input_step_fast = 100;
@@ -1916,13 +2018,13 @@ namespace
 		uint32_t pick_limit = s_pick_limit.load(std::memory_order_relaxed);
 		const uint32_t pick_limit_step = 1;
 		const uint32_t pick_limit_step_fast = 32;
-		if (ImGui::InputScalar("Max center results", ImGuiDataType_U32, &pick_limit, &pick_limit_step, &pick_limit_step_fast, "%u"))
+		if (ImGui::InputScalar("Max mouse-position results", ImGuiDataType_U32, &pick_limit, &pick_limit_step, &pick_limit_step_fast, "%u"))
 			s_pick_limit.store(std::max(1u, pick_limit), std::memory_order_relaxed);
-		ImGui::SetItemTooltip("Maximum number of indexed draw records returned by the one-shot center picker. Default is 32; enter a larger value when needed.");
+		ImGui::SetItemTooltip("Maximum number of indexed draw records returned by the one-shot mouse-position picker. Default is 32; enter a larger value when needed.");
 
 		if constexpr (!s_enable_native_center_probe)
 		{
-			ImGui::TextDisabled("Center picker temporarily disabled for isolation test.");
+			ImGui::TextDisabled("Mouse-position picker temporarily disabled for isolation test.");
 		}
 		else
 		{
@@ -1934,9 +2036,20 @@ namespace
 				center_results = s_pick_results;
 			}
 
-			if (center_pick_state == pick_status::scanning || center_pick_state == pick_status::waiting || center_pick_state == pick_status::armed)
-				ImGui::TextDisabled("Get center object index: %s", pick_status_text(center_pick_state));
-			else if (ImGui::Button("Get center object index"))
+			if (center_pick_state == pick_status::awaiting_click)
+			{
+				ImGui::TextDisabled("Pick object at mouse position: %s", pick_status_text(center_pick_state));
+				if (ImGui::Button("Cancel mouse capture"))
+				{
+					std::lock_guard lock(s_pick_mutex);
+					s_mouse_pick_waiting = false;
+					s_mouse_pick_waiting_release = false;
+					s_pick_state = pick_status::idle;
+				}
+			}
+			else if (center_pick_state == pick_status::scanning || center_pick_state == pick_status::waiting || center_pick_state == pick_status::armed)
+				ImGui::TextDisabled("Pick object at mouse position: %s", pick_status_text(center_pick_state));
+			else if (ImGui::Button("Pick object at mouse position"))
 			{
 				bool arm_picker = false;
 				{
@@ -1945,13 +2058,24 @@ namespace
 					{
 						s_pick_results.clear();
 						s_pending_pick.clear();
-						s_pick_requested.store(true, std::memory_order_relaxed);
-						s_pick_state = pick_status::armed;
+						s_mouse_pick_waiting = runtime != nullptr;
+						s_mouse_pick_waiting_release = runtime != nullptr && runtime->is_mouse_button_down(0);
+						s_mouse_pick_last_down = s_mouse_pick_waiting_release;
+						s_pick_target_x.store(-1, std::memory_order_relaxed);
+						s_pick_target_y.store(-1, std::memory_order_relaxed);
+						s_pick_state = s_mouse_pick_waiting ? pick_status::awaiting_click : pick_status::unsupported;
 						arm_picker = true;
 					}
 				}
 				if (arm_picker)
+				{
 					enable_center_picker_after_draw_event();
+					if (runtime != nullptr)
+					{
+						runtime->block_input_next_frame();
+						runtime->open_overlay(false, input_source::mouse);
+					}
+				}
 			}
 
 			ImGui::SameLine();
@@ -1960,7 +2084,7 @@ namespace
 			if (!center_results.empty())
 			{
 				ImGui::Separator();
-				ImGui::TextUnformatted("Center candidates (latest draw first):");
+				ImGui::TextUnformatted("Mouse-position candidates (latest draw first):");
 				for (size_t i = 0; i < center_results.size(); ++i)
 				{
 					const pick_candidate &candidate = center_results[i];

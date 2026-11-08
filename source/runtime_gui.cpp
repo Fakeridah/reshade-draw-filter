@@ -833,7 +833,7 @@ void reshade::runtime::draw_gui()
 	_gather_gpu_statistics = false;
 	_effects_expanded_state &= 2;
 
-	if (!show_splash_window && !show_message_window && !show_statistics_window && !_show_overlay && _preview_texture == std::numeric_limits<size_t>::max()
+	if (!show_splash_window && !show_message_window && !show_statistics_window && !_show_overlay && !_block_input_next_frame && _preview_texture == std::numeric_limits<size_t>::max()
 #if RESHADE_ADDON
 		&& !has_addon_event<addon_event::reshade_overlay>()
 #endif
@@ -860,7 +860,7 @@ void reshade::runtime::draw_gui()
 
 	if (_input != nullptr)
 	{
-		imgui_io.MouseDrawCursor = _show_overlay && (!_should_save_screenshot || !_screenshot_save_gui);
+		imgui_io.MouseDrawCursor = (_show_overlay || _block_input_next_frame) && (!_should_save_screenshot || !_screenshot_save_gui);
 
 		// Scale mouse position in case render resolution does not match the window size
 		unsigned int max_position[2];
@@ -1501,7 +1501,7 @@ void reshade::runtime::draw_gui()
 	if (_primary_input_handler && _input != nullptr)
 	{
 		const bool block_input = _input_processing_mode != 0 && (_show_overlay || _block_input_next_frame);
-		const bool block_mouse_input = block_input && (imgui_io.WantCaptureMouse || _input_processing_mode == 2);
+		const bool block_mouse_input = block_input && (_block_input_next_frame || imgui_io.WantCaptureMouse || _input_processing_mode == 2);
 		const bool block_keyboard_input = block_input && (imgui_io.WantCaptureKeyboard || _input_processing_mode == 2);
 
 		_input->block_mouse_input(block_mouse_input);
@@ -5114,7 +5114,12 @@ bool reshade::runtime::open_overlay(bool open, api::input_source source)
 	_show_overlay = open;
 
 	if (open)
+	{
+		// Opening the overlay dismisses the initial splash prompt. Otherwise it is
+		// shown again when the overlay is closed while the tutorial is still at step 0.
+		_show_splash = false;
 		_imgui_context->NavInputSource = static_cast<ImGuiInputSource>(source);
+	}
 
 	return true;
 }
