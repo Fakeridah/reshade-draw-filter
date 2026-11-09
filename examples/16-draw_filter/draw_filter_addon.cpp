@@ -10,19 +10,28 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <memory>
 #include <set>
 #include <string>
 #include <mutex>
 #include <shared_mutex>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include "../utils/descriptor_tracking.hpp"
+
 using namespace reshade::api;
+
+extern bool save_texture_image(const reshade::api::resource_desc &desc, const reshade::api::subresource_data &data);
 
 namespace
 {
@@ -109,6 +118,32 @@ namespace
 		resource index_buffer = {};
 		uint64_t index_buffer_offset = 0;
 		uint32_t index_size = 0;
+		std::vector<resource> vertex_buffers;
+		std::vector<uint64_t> vertex_buffer_offsets;
+		std::vector<uint32_t> vertex_buffer_strides;
+
+		struct shader_resource_binding
+		{
+			resource_view view = {};
+			resource resource = {};
+			resource_desc desc = {};
+			shader_stage stages = shader_stage::all;
+			uint32_t binding = 0;
+		};
+		std::unordered_map<uint64_t, shader_resource_binding> shader_resources;
+	};
+
+	struct draw_capture
+	{
+		resource index_buffer = {};
+		uint64_t index_buffer_offset = 0;
+		uint32_t index_size = 0;
+		std::vector<resource> vertex_buffers;
+		std::vector<uint64_t> vertex_buffer_offsets;
+		std::vector<uint32_t> vertex_buffer_strides;
+		std::vector<draw_state::shader_resource_binding> shader_resources;
+		resource render_target = {};
+		resource_view depth_stencil = {};
 	};
 
 	struct pick_candidate
@@ -126,6 +161,7 @@ namespace
 		ID3D11Query *query = nullptr;
 		query_heap api_query_heap = {};
 		uint32_t api_query_index = UINT32_MAX;
+		draw_capture capture = {};
 	};
 
 	struct marker_state
@@ -190,6 +226,9 @@ namespace
 	uint64_t s_pick_draw_order = 0;
 	std::vector<pick_candidate> s_pending_pick;
 	std::vector<pick_candidate> s_pick_results;
+	uint32_t s_export_index_count = 0;
+	std::vector<pick_candidate> s_export_candidates;
+	int s_selected_export_candidate = -1;
 	std::mutex s_probe_mutex;
 	std::unordered_map<command_list *, probe_state> s_active_probes;
 	std::mutex s_marker_mutex;
@@ -207,6 +246,7 @@ namespace
 
 	void add_draw_match(const draw_match &match);
 	bool capture_draw_match(command_list *cmd_list, uint32_t index_count, uint32_t instance_count, uint32_t first_index, int32_t vertex_offset, uint32_t first_instance, draw_match &match);
+	uint32_t estimate_primitive_count(D3D11_PRIMITIVE_TOPOLOGY topology, uint32_t index_count);
 
 	bool center_picker_needs_state()
 	{
@@ -363,6 +403,18 @@ namespace
 			s_blocked_index_counts.push_back(index_count);
 	}
 
+	void find_export_candidates(uint32_t index_count)
+	{
+		std::lock_guard lock(s_pick_mutex);
+		s_export_candidates.clear();
+		s_selected_export_candidate = -1;
+		if (index_count == 0)
+			return;
+		for (const pick_candidate &candidate : s_pick_results)
+			if (candidate.index_count == index_count)
+				s_export_candidates.push_back(candidate);
+	}
+
 	void on_init_swapchain(swapchain *swapchain, bool)
 	{
 		std::lock_guard lock(s_state_mutex);
@@ -487,6 +539,170 @@ namespace
 
 		std::lock_guard lock(s_state_mutex);
 		s_command_states[cmd_list].current_pipeline = pipeline;
+	}
+
+	uint64_t shader_resource_binding_key(shader_stage stages, uint32_t binding)
+	{
+		return (static_cast<uint64_t>(static_cast<uint32_t>(stages)) << 32) | binding;
+	}
+
+	void update_shader_resource_binding(command_list *cmd_list, shader_stage stages, uint32_t binding, resource_view view)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return;
+
+		std::lock_guard lock(s_state_mutex);
+		draw_state &state = s_command_states[cmd_list];
+		const uint64_t key = shader_resource_binding_key(stages, binding);
+		if (view == 0)
+		{
+			state.shader_resources.erase(key);
+			return;
+		}
+
+		draw_state::shader_resource_binding binding_info;
+		binding_info.view = view;
+		binding_info.stages = stages;
+		binding_info.binding = binding;
+		binding_info.resource = cmd_list->get_device()->get_resource_from_view(view);
+		if (binding_info.resource != 0)
+			binding_info.desc = cmd_list->get_device()->get_resource_desc(binding_info.resource);
+		state.shader_resources[key] = binding_info;
+	}
+
+	void on_bind_index_buffer(command_list *cmd_list, resource buffer, uint64_t offset, uint32_t index_size)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return;
+
+		std::lock_guard lock(s_state_mutex);
+		draw_state &state = s_command_states[cmd_list];
+		state.index_buffer = buffer;
+		state.index_buffer_offset = offset;
+		state.index_size = index_size;
+	}
+
+	void on_bind_vertex_buffers(command_list *cmd_list, uint32_t first, uint32_t count, const resource *buffers, const uint64_t *offsets, const uint32_t *strides)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return;
+
+		std::lock_guard lock(s_state_mutex);
+		draw_state &state = s_command_states[cmd_list];
+		if (first == 0 && count == 0)
+		{
+			state.vertex_buffers.clear();
+			state.vertex_buffer_offsets.clear();
+			state.vertex_buffer_strides.clear();
+			return;
+		}
+		if (buffers == nullptr)
+			return;
+
+		if (state.vertex_buffers.size() < first + count)
+		{
+			state.vertex_buffers.resize(first + count);
+			state.vertex_buffer_offsets.resize(first + count);
+			state.vertex_buffer_strides.resize(first + count);
+		}
+		for (uint32_t i = 0; i < count; ++i)
+		{
+			state.vertex_buffers[first + i] = buffers[i];
+			state.vertex_buffer_offsets[first + i] = offsets != nullptr ? offsets[i] : 0;
+			state.vertex_buffer_strides[first + i] = strides != nullptr ? strides[i] : 0;
+		}
+	}
+
+	void on_push_descriptors(command_list *cmd_list, shader_stage stages, pipeline_layout, uint32_t, const descriptor_table_update &update)
+	{
+		if (cmd_list == nullptr || !center_picker_needs_state())
+			return;
+
+		for (uint32_t i = 0; i < update.count; ++i)
+		{
+			resource_view view = {};
+			switch (update.type)
+			{
+			case descriptor_type::shader_resource_view:
+			case descriptor_type::buffer_shader_resource_view:
+				view = static_cast<const resource_view *>(update.descriptors)[i];
+				break;
+			case descriptor_type::sampler_with_resource_view:
+				view = static_cast<const sampler_with_resource_view *>(update.descriptors)[i].view;
+				break;
+			default:
+				continue;
+			}
+			update_shader_resource_binding(cmd_list, stages, update.binding + i, view);
+		}
+	}
+
+	void on_bind_descriptor_tables(command_list *cmd_list, shader_stage stages, pipeline_layout layout, uint32_t first, uint32_t count, const descriptor_table *tables, uint32_t, const uint32_t *)
+	{
+		if (cmd_list == nullptr || tables == nullptr || !center_picker_needs_state())
+			return;
+
+		// D3D11 emits push_descriptors directly. D3D12 and Vulkan usually bind
+		// descriptor tables, so use the shared descriptor tracker to expand the
+		// ranges into the resource views used by this draw.
+		descriptor_tracking *const descriptor_data = cmd_list->get_device()->get_private_data<descriptor_tracking>();
+		if (descriptor_data == nullptr)
+			return;
+
+		try
+		{
+			for (uint32_t i = 0; i < count; ++i)
+			{
+				const pipeline_layout_param param = descriptor_data->get_pipeline_layout_param(layout, first + i);
+				if (param.type != pipeline_layout_param_type::descriptor_table || param.descriptor_table.ranges == nullptr)
+					continue;
+
+				for (uint32_t range_index = 0; range_index < param.descriptor_table.count; ++range_index)
+				{
+					const descriptor_range &range = param.descriptor_table.ranges[range_index];
+					if (range.count == UINT32_MAX || range.count > 4096 || (range.visibility & stages) == static_cast<shader_stage>(0))
+						continue;
+					if (range.type != descriptor_type::shader_resource_view &&
+						range.type != descriptor_type::texture_shader_resource_view &&
+						range.type != descriptor_type::buffer_shader_resource_view &&
+						range.type != descriptor_type::sampler_with_resource_view)
+						continue;
+
+					descriptor_heap heap = {};
+					uint32_t base_offset = 0;
+					cmd_list->get_device()->get_descriptor_heap_offset(tables[i], range.binding, 0, &heap, &base_offset);
+					for (uint32_t j = 0; j < range.count; ++j)
+						update_shader_resource_binding(cmd_list, stages, range.binding + j, descriptor_data->get_resource_view(heap, base_offset + j));
+				}
+			}
+		}
+		catch (...)
+		{
+			// Descriptor tables can be transient. A missing table is not fatal to
+			// filtering or picking; it only means this draw has fewer export hints.
+		}
+	}
+
+	draw_capture capture_draw_state(const draw_state &state)
+	{
+		draw_capture capture;
+		capture.index_buffer = state.index_buffer;
+		capture.index_buffer_offset = state.index_buffer_offset;
+		capture.index_size = state.index_size;
+		capture.vertex_buffers = state.vertex_buffers;
+		capture.vertex_buffer_offsets = state.vertex_buffer_offsets;
+		capture.vertex_buffer_strides = state.vertex_buffer_strides;
+		capture.render_target = state.render_target;
+		capture.depth_stencil = state.depth_stencil;
+		capture.shader_resources.reserve(state.shader_resources.size());
+		for (const auto &[key, binding] : state.shader_resources)
+			capture.shader_resources.push_back(binding);
+		std::sort(capture.shader_resources.begin(), capture.shader_resources.end(), [](const auto &lhs, const auto &rhs) {
+			if (lhs.stages != rhs.stages)
+				return static_cast<uint32_t>(lhs.stages) < static_cast<uint32_t>(rhs.stages);
+			return lhs.binding < rhs.binding;
+		});
+		return capture;
 	}
 
 	bool is_back_buffer(resource resource)
@@ -637,6 +853,208 @@ namespace
 		hash_draw_value(hash, match.depth_stencil_format);
 		hash_draw_value(hash, static_cast<uint32_t>(match.topology));
 		return hash;
+	}
+
+	const char *pass_kind_text(const pick_candidate &candidate)
+	{
+		std::string marker = candidate.event_name;
+		std::transform(marker.begin(), marker.end(), marker.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+		if (marker.find("shadow") != std::string::npos)
+			return "Shadow-like";
+		if (marker.find("depth") != std::string::npos || marker.find("earlyz") != std::string::npos)
+			return "Depth-like";
+		if (marker.find("transparent") != std::string::npos || marker.find("transluc") != std::string::npos)
+			return "Transparent-like";
+		if (candidate.match.valid && candidate.match.pixel_shader == 0 && candidate.match.depth_stencil_format != DXGI_FORMAT_UNKNOWN)
+			return "Depth-like";
+		if (candidate.match.valid && candidate.match.render_target_format != DXGI_FORMAT_UNKNOWN)
+			return "Material-like";
+		return "Other";
+	}
+
+	std::filesystem::path get_export_root()
+	{
+		wchar_t module_path[MAX_PATH] = L"";
+		GetModuleFileNameW(nullptr, module_path, ARRAYSIZE(module_path));
+		std::filesystem::path game_path = module_path;
+		std::wstring game_name = game_path.stem().wstring();
+		if (game_name.empty())
+			game_name = L"UnknownGame";
+		// Keep captures beside the source checkout, rather than beside the game.
+		// This makes it easy to keep one export directory per game and prevents
+		// generated resources from being mixed into the game installation.
+		std::filesystem::path root = L"E:\\A\\reshade\\DrawFilterExports";
+		root /= game_name;
+		std::error_code error;
+		std::filesystem::create_directories(root, error);
+		return root;
+	}
+
+	bool dump_d3d11_buffer(ID3D11DeviceContext *context, ID3D11Buffer *source, const std::filesystem::path &path)
+	{
+		if (context == nullptr || source == nullptr)
+			return false;
+
+		D3D11_BUFFER_DESC source_desc = {};
+		source->GetDesc(&source_desc);
+		if (source_desc.ByteWidth == 0 || source_desc.ByteWidth > 512ull * 1024ull * 1024ull)
+			return false;
+
+		ID3D11Device *device = nullptr;
+		context->GetDevice(&device);
+		if (device == nullptr)
+			return false;
+
+		D3D11_BUFFER_DESC staging_desc = source_desc;
+		staging_desc.Usage = D3D11_USAGE_STAGING;
+		staging_desc.BindFlags = 0;
+		staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+		staging_desc.MiscFlags = 0;
+		staging_desc.StructureByteStride = 0;
+
+		ID3D11Buffer *staging = nullptr;
+		const HRESULT create_result = device->CreateBuffer(&staging_desc, nullptr, &staging);
+		device->Release();
+		if (FAILED(create_result) || staging == nullptr)
+			return false;
+
+		context->CopyResource(staging, source);
+		context->Flush();
+
+		D3D11_MAPPED_SUBRESOURCE mapped = {};
+		const HRESULT map_result = context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped);
+		if (FAILED(map_result))
+		{
+			staging->Release();
+			return false;
+		}
+
+		std::ofstream output(path, std::ios::binary);
+		if (output)
+			output.write(static_cast<const char *>(mapped.pData), source_desc.ByteWidth);
+		const bool success = static_cast<bool>(output);
+		context->Unmap(staging, 0);
+		staging->Release();
+		return success;
+	}
+
+	bool dump_texture_resource(command_queue *queue, resource texture, const resource_desc &desc)
+	{
+		if (queue == nullptr || texture == 0 || desc.type == resource_type::buffer)
+			return false;
+
+		device *const device = queue->get_device();
+		resource intermediate = {};
+		if (desc.heap != memory_heap::default_)
+		{
+			intermediate = texture;
+		}
+		else
+		{
+			if ((desc.usage & resource_usage::copy_source) != resource_usage::copy_source)
+				return false;
+			const format typed_format = format_to_default_typed(desc.texture.format, 1);
+			if (typed_format == format::unknown)
+				return false;
+			if (!device->create_resource(resource_desc(desc.texture.width, desc.texture.height, 1, 1, typed_format, 1, memory_heap::readback, resource_usage::copy_dest), nullptr, resource_usage::copy_dest, &intermediate))
+				return false;
+
+			command_list *const cmd_list = queue->get_immediate_command_list();
+			cmd_list->barrier(texture, resource_usage::shader_resource, resource_usage::copy_source);
+			cmd_list->copy_texture_region(texture, 0, nullptr, intermediate, 0, nullptr);
+			cmd_list->barrier(texture, resource_usage::copy_source, resource_usage::shader_resource);
+
+			// The copy is queued asynchronously. Wait before mapping the readback
+			// resource, otherwise the export may be incomplete or driver-dependent.
+			fence copy_sync_fence = {};
+			if (!device->create_fence(0, fence_flags::none, &copy_sync_fence) || !queue->signal(copy_sync_fence, 1) || !device->wait(copy_sync_fence, 1))
+				queue->wait_idle();
+			device->destroy_fence(copy_sync_fence);
+		}
+
+		subresource_data mapped_data = {};
+		const bool mapped = device->map_texture_region(intermediate, 0, nullptr, map_access::read_only, &mapped_data);
+		bool success = false;
+		if (mapped)
+		{
+			resource_desc image_desc = desc;
+			image_desc.heap = memory_heap::readback;
+			success = save_texture_image(image_desc, mapped_data);
+			device->unmap_texture_region(intermediate, 0);
+		}
+
+		if (intermediate != texture)
+			device->destroy_resource(intermediate);
+		return success;
+	}
+
+	bool export_candidate_resources(command_queue *queue, const pick_candidate &candidate)
+	{
+		if (queue == nullptr)
+			return false;
+
+		const uint64_t key = draw_signature_key(candidate.match);
+		const std::filesystem::path directory = get_export_root() / (L"candidate_" + std::to_wstring(key));
+		std::error_code error;
+		std::filesystem::create_directories(directory, error);
+
+		std::ofstream manifest(directory / "manifest.txt", std::ios::trunc);
+		if (!manifest)
+			return false;
+
+		manifest << "Draw Filter export\n";
+		manifest << "Candidate key: " << std::hex << key << std::dec << "\n";
+		manifest << "Pass: " << pass_kind_text(candidate) << "\n";
+		manifest << "Event: " << (candidate.event_name.empty() ? "No GPU event marker" : candidate.event_name) << "\n";
+		manifest << "Index count: " << candidate.index_count << "\n";
+		manifest << "Instance count: " << candidate.instance_count << "\n";
+		manifest << "Estimated primitives: " << estimate_primitive_count(candidate.topology, candidate.index_count) << "\n";
+		manifest << "Mesh buffers are exported as raw D3D11 buffers when available.\n";
+		manifest << "Textures are exported through the standard ReShade texdump writer.\n\n";
+
+		if (candidate.capture.index_buffer != 0)
+		{
+			manifest << "Index buffer: 0x" << std::hex << candidate.capture.index_buffer.handle << std::dec
+				<< ", offset=" << candidate.capture.index_buffer_offset << ", index_size=" << candidate.capture.index_size << "\n";
+		}
+		for (size_t i = 0; i < candidate.capture.vertex_buffers.size(); ++i)
+		{
+			manifest << "Vertex buffer " << i << ": 0x" << std::hex << candidate.capture.vertex_buffers[i].handle << std::dec
+				<< ", offset=" << (i < candidate.capture.vertex_buffer_offsets.size() ? candidate.capture.vertex_buffer_offsets[i] : 0)
+				<< ", stride=" << (i < candidate.capture.vertex_buffer_strides.size() ? candidate.capture.vertex_buffer_strides[i] : 0) << "\n";
+		}
+
+		std::unordered_set<uint64_t> dumped_resources;
+		uint32_t texture_count = 0;
+		uint32_t texture_dumped = 0;
+		for (const draw_state::shader_resource_binding &binding : candidate.capture.shader_resources)
+		{
+			if (binding.resource == 0 || binding.view == 0 || !dumped_resources.insert(binding.resource.handle).second)
+				continue;
+			manifest << "Texture resource: 0x" << std::hex << binding.resource.handle << std::dec
+				<< ", view=0x" << std::hex << binding.view.handle << std::dec
+				<< ", binding=" << binding.binding << ", desc=" << binding.desc.texture.width << 'x' << binding.desc.texture.height << "\n";
+			++texture_count;
+			if (binding.desc.type != resource_type::buffer && dump_texture_resource(queue, binding.resource, binding.desc))
+				++texture_dumped;
+		}
+		manifest << "Textures found: " << texture_count << ", dumped: " << texture_dumped << "\n";
+
+		if (queue->get_device()->get_api() == device_api::d3d11 && candidate.match.valid)
+		{
+			ID3D11DeviceContext *context = reinterpret_cast<ID3D11DeviceContext *>(static_cast<uintptr_t>(queue->get_native()));
+			if (context != nullptr)
+			{
+				const std::filesystem::path index_path = directory / "index_buffer.bin";
+				const std::filesystem::path vertex_path = directory / "vertex_buffer.bin";
+				const bool index_dumped = dump_d3d11_buffer(context, reinterpret_cast<ID3D11Buffer *>(candidate.match.index_buffer), index_path);
+				const bool vertex_dumped = dump_d3d11_buffer(context, reinterpret_cast<ID3D11Buffer *>(candidate.match.vertex_buffer), vertex_path);
+				manifest << "Raw index buffer: " << (index_dumped ? index_path.string() : "not available") << "\n";
+				manifest << "Raw vertex buffer: " << (vertex_dumped ? vertex_path.string() : "not available") << "\n";
+			}
+		}
+
+		return true;
 	}
 
 	bool same_geometry_match(const draw_match &lhs, const draw_match &rhs)
@@ -1875,6 +2293,7 @@ namespace
 			{
 				probe.candidate.draw_order = draw_order;
 				probe.candidate.event_name = std::move(event_name);
+				probe.candidate.capture = capture_draw_state(state);
 				std::lock_guard lock(s_probe_mutex);
 				if (s_active_probes.find(cmd_list) == s_active_probes.end())
 					s_active_probes.emplace(cmd_list, std::move(probe));
@@ -1949,6 +2368,8 @@ namespace
 		s_pick_armed = false;
 		s_pick_active = false;
 		s_pick_finished = false;
+		s_export_candidates.clear();
+		s_selected_export_candidate = -1;
 		s_mouse_pick_waiting = false;
 		s_mouse_pick_waiting_release = false;
 		s_mouse_pick_last_down = false;
@@ -2012,6 +2433,64 @@ namespace
 		{
 			add_index_count(s_input_index_count);
 			s_input_index_count = 0;
+		}
+
+		ImGui::Separator();
+		ImGui::TextUnformatted("Export mesh and material resources");
+		ImGui::SetItemTooltip("Uses the latest mouse-position capture. The number is only a search condition; each result is a separate draw/pass candidate.");
+		const bool export_submitted = ImGui::InputScalar("Export index count", ImGuiDataType_U32, &s_export_index_count, &input_step, &input_step_fast, "%u", ImGuiInputTextFlags_EnterReturnsTrue);
+		ImGui::SameLine();
+		const bool find_export_clicked = ImGui::Button("Find candidates");
+		if ((export_submitted || find_export_clicked) && s_export_index_count != 0)
+			find_export_candidates(s_export_index_count);
+
+		std::vector<pick_candidate> export_candidates;
+		int selected_export_candidate = -1;
+		{
+			std::lock_guard lock(s_pick_mutex);
+			export_candidates = s_export_candidates;
+			selected_export_candidate = s_selected_export_candidate;
+		}
+		if (!export_candidates.empty())
+		{
+			ImGui::Text("Candidates for index count %u:", s_export_index_count);
+			for (size_t i = 0; i < export_candidates.size(); ++i)
+			{
+				const pick_candidate &candidate = export_candidates[i];
+				ImGui::PushID(static_cast<int>(i));
+				const bool selected = selected_export_candidate == static_cast<int>(i);
+				if (ImGui::Selectable("##export_candidate", selected, ImGuiSelectableFlags_AllowDoubleClick, ImVec2(0, ImGui::GetTextLineHeightWithSpacing())))
+				{
+					std::lock_guard lock(s_pick_mutex);
+					s_selected_export_candidate = static_cast<int>(i);
+				}
+				ImGui::SameLine();
+				ImGui::Text("#%zu  %s  VB:%zu  Prim:%u", i + 1, pass_kind_text(candidate),
+					candidate.capture.vertex_buffers.size(),
+					estimate_primitive_count(candidate.topology, candidate.index_count));
+				ImGui::SameLine();
+				if (ImGui::SmallButton("Select"))
+				{
+					std::lock_guard lock(s_pick_mutex);
+					s_selected_export_candidate = static_cast<int>(i);
+				}
+				ImGui::PopID();
+			}
+			if (selected_export_candidate >= 0 && selected_export_candidate < static_cast<int>(export_candidates.size()))
+			{
+				if (ImGui::Button("Export selected candidate"))
+				{
+					const bool success = runtime != nullptr && export_candidate_resources(runtime->get_command_queue(), export_candidates[selected_export_candidate]);
+					reshade::log::message(success ? reshade::log::level::info : reshade::log::level::warning,
+						success ? "Draw Filter: exported selected draw candidate." : "Draw Filter: failed to export selected draw candidate.");
+				}
+				ImGui::SameLine();
+				ImGui::TextDisabled("Pass resources are listed in DrawFilterExports and texdump.");
+			}
+		}
+		else if (s_export_index_count != 0)
+		{
+			ImGui::TextDisabled("No candidates found. Run Pick object at mouse position first.");
 		}
 
 		ImGui::Text("Skipped draws this session: %llu", static_cast<unsigned long long>(s_skipped_draws.load(std::memory_order_relaxed)));
@@ -2186,6 +2665,7 @@ namespace
 
 void register_addon_draw_filter()
 {
+	descriptor_tracking::register_events();
 	reshade::register_overlay(nullptr, draw_settings_overlay);
 	reshade::register_event<reshade::addon_event::draw_indexed>(on_draw_indexed);
 	reshade::register_event<reshade::addon_event::bind_render_targets_and_depth_stencil>(on_bind_render_targets_and_depth_stencil);
@@ -2194,6 +2674,10 @@ void register_addon_draw_filter()
 	reshade::register_event<reshade::addon_event::bind_pipeline_states>(on_bind_pipeline_states);
 	reshade::register_event<reshade::addon_event::bind_viewports>(on_bind_viewports);
 	reshade::register_event<reshade::addon_event::bind_scissor_rects>(on_bind_scissor_rects);
+	reshade::register_event<reshade::addon_event::bind_index_buffer>(on_bind_index_buffer);
+	reshade::register_event<reshade::addon_event::bind_vertex_buffers>(on_bind_vertex_buffers);
+	reshade::register_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
+	reshade::register_event<reshade::addon_event::bind_descriptor_tables>(on_bind_descriptor_tables);
 	reshade::register_event<reshade::addon_event::begin_debug_event>(on_begin_debug_event);
 	reshade::register_event<reshade::addon_event::end_debug_event>(on_end_debug_event);
 	reshade::register_event<reshade::addon_event::insert_debug_marker>(on_insert_debug_marker);
@@ -2212,12 +2696,17 @@ void unregister_addon_draw_filter()
 	reshade::unregister_event<reshade::addon_event::bind_pipeline_states>(on_bind_pipeline_states);
 	reshade::unregister_event<reshade::addon_event::bind_viewports>(on_bind_viewports);
 	reshade::unregister_event<reshade::addon_event::bind_scissor_rects>(on_bind_scissor_rects);
+	reshade::unregister_event<reshade::addon_event::bind_index_buffer>(on_bind_index_buffer);
+	reshade::unregister_event<reshade::addon_event::bind_vertex_buffers>(on_bind_vertex_buffers);
+	reshade::unregister_event<reshade::addon_event::push_descriptors>(on_push_descriptors);
+	reshade::unregister_event<reshade::addon_event::bind_descriptor_tables>(on_bind_descriptor_tables);
 	reshade::unregister_event<reshade::addon_event::begin_debug_event>(on_begin_debug_event);
 	reshade::unregister_event<reshade::addon_event::end_debug_event>(on_end_debug_event);
 	reshade::unregister_event<reshade::addon_event::insert_debug_marker>(on_insert_debug_marker);
 	reshade::unregister_event<reshade::addon_event::present>(on_present);
 	reshade::unregister_event<reshade::addon_event::finish_present>(on_finish_present);
 	reshade::unregister_event<reshade::addon_event::destroy_device>(on_destroy_device);
+	descriptor_tracking::unregister_events();
 }
 
 #ifndef BUILTIN_ADDON

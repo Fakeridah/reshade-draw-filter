@@ -3,13 +3,20 @@
  * SPDX-License-Identifier: BSD-3-Clause OR MIT
  */
 
+#if !defined(BUILTIN_ADDON)
 #define STB_IMAGE_WRITE_IMPLEMENTATION
+#endif
 
+#include <Windows.h>
 #include <reshade.hpp>
 #include "config.hpp"
 #include "crc32_hash.hpp"
 #include <vector>
 #include <filesystem>
+#include <fstream>
+#ifdef STBI_WRITE_NO_STDIO
+#undef STBI_WRITE_NO_STDIO
+#endif
 #include <stb_image_write.h>
 
 #if RESHADE_ADDON_TEXTURE_SAVE_ENABLE_HASH_SET
@@ -25,12 +32,21 @@ static std::filesystem::path make_texture_file_path(uint32_t texture_hash)
 	GetModuleFileNameW(nullptr, file_prefix, ARRAYSIZE(file_prefix));
 
 	std::filesystem::path path = file_prefix;
+	#if defined(BUILTIN_ADDON)
+	// Built-in draw-filter exports belong to the ReShade source checkout,
+	// grouped by the executable that produced them. Keep them out of the game
+	// directory so generated resources can be ignored by Git in one place.
+	std::filesystem::path game_path = file_prefix;
+	path = L"E:\\A\\reshade\\DrawFilterExports";
+	path /= game_path.stem();
+	#else
 	path = path.parent_path();
+	#endif
 	path /= RESHADE_ADDON_TEXTURE_SAVE_DIR;
 
 	// Ensure target directory exists
-	if (!std::filesystem::exists(path))
-		std::filesystem::create_directory(path);
+	std::error_code error;
+	std::filesystem::create_directories(path, error);
 
 	wchar_t hash_string[11];
 	swprintf_s(hash_string, L"0x%08X", texture_hash);
@@ -131,7 +147,11 @@ bool save_texture_image(const resource_desc &desc, const subresource_data &data)
 	static std::set<uint32_t> hash_set;
 	if (hash_set.find(hash) != hash_set.end())
 	{
+	#if defined(BUILTIN_ADDON)
+		OutputDebugStringA("ReShade texture export skipped because the texture was already dumped.\n");
+	#else
 		reshade::log::message(reshade::log::level::error, "Skipped texture that was already dumped.");
+	#endif
 		return true;
 	}
 	else
@@ -428,11 +448,17 @@ bool save_texture_image(const resource_desc &desc, const subresource_data &data)
 	}
 
 	const std::filesystem::path file_path = make_texture_file_path(hash);
+	std::ofstream file(file_path, std::ios::binary);
+	if (!file)
+		return false;
+	const auto write_callback = [](void *context, void *data, int size) {
+		static_cast<std::ofstream *>(context)->write(static_cast<const char *>(data), size);
+	};
 
 	if (file_path.extension() == L".bmp")
-		return stbi_write_bmp(file_path.u8string().c_str(), desc.texture.width, desc.texture.height, 4, rgba_pixel_data.data()) != 0;
+		return stbi_write_bmp_to_func(write_callback, &file, desc.texture.width, desc.texture.height, 4, rgba_pixel_data.data()) != 0;
 	else if (file_path.extension() == L".png")
-		return stbi_write_png(file_path.u8string().c_str(), desc.texture.width, desc.texture.height, 4, rgba_pixel_data.data(), desc.texture.width * 4) != 0;
+		return stbi_write_png_to_func(write_callback, &file, desc.texture.width, desc.texture.height, 4, rgba_pixel_data.data(), desc.texture.width * 4) != 0;
 	else
 		return false;
 }
